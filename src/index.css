@@ -60,6 +60,51 @@ All colors MUST be HSL.
     /* Animations */
     --transition-smooth: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   }
+
+  .dark {
+    /* Dark mode university-inspired color palette */
+    --background: 220 25% 8%;
+    --foreground: 0 0% 95%;
+
+    --card: 220 20% 12%;
+    --card-foreground: 0 0% 95%;
+
+    --popover: 220 20% 12%;
+    --popover-foreground: 0 0% 95%;
+
+    /* Brighter blue for dark mode */
+    --primary: 220 80% 50%;
+    --primary-foreground: 0 0% 100%;
+    --primary-light: 220 70% 20%;
+    
+    /* Dark blue accent */
+    --secondary: 220 30% 15%;
+    --secondary-foreground: 220 80% 70%;
+
+    --muted: 220 20% 18%;
+    --muted-foreground: 220 15% 65%;
+
+    /* Warm accent for CTAs */
+    --accent: 35 95% 55%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 220 20% 20%;
+    --input: 220 20% 18%;
+    --ring: 220 80% 50%;
+
+    /* Chat-specific colors for dark mode */
+    --chat-user-bg: 220 80% 50%;
+    --chat-user-fg: 0 0% 100%;
+    --chat-bot-bg: 220 20% 15%;
+    --chat-bot-fg: 0 0% 95%;
+    
+    /* Dark mode shadows */
+    --shadow-card: 0 2px 8px -2px hsl(0 0% 0% / 0.3);
+    --shadow-elevated: 0 8px 24px -4px hsl(0 0% 0% / 0.5);
+  }
 }
 
 @layer base {

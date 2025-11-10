@@ -1,5 +1,7 @@
-import { useState } from "react";
-import { Bot } from "lucide-react";
+import { useState, useEffect, useRef } from "react";
+import { Bot, Moon, Sun } from "lucide-react";
+import { useTheme } from "next-themes";
+import { Button } from "@/components/ui/button";
 import MessageBubble from "@/components/chat/MessageBubble";
 import TypingIndicator from "@/components/chat/TypingIndicator";
 import QuickReplyButtons from "@/components/chat/QuickReplyButtons";
@@ -16,6 +18,8 @@ interface Message {
 }
 
 const Index = () => {
+  const { theme, setTheme } = useTheme();
+  const messagesEndRef = useRef<HTMLDivElement>(null);
   const [messages, setMessages] = useState<Message[]>([
     {
       id: "1",
@@ -30,6 +34,11 @@ const Index = () => {
     },
   ]);
   const [isTyping, setIsTyping] = useState(false);
+
+  // Auto-scroll to bottom when messages change
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, isTyping]);
 
   const handleQuickReply = (action: string) => {
     // Add user message
@@ -90,14 +99,26 @@ const Index = () => {
       <div className="w-full max-w-3xl h-[90vh] rounded-3xl shadow-elevated bg-card border border-border overflow-hidden flex flex-col">
         {/* Header */}
         <div className="bg-gradient-to-r from-primary to-primary/90 p-6 text-primary-foreground">
-          <div className="flex items-center gap-3">
-            <div className="h-12 w-12 rounded-full bg-primary-foreground/10 flex items-center justify-center">
-              <Bot className="h-6 w-6" />
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="h-12 w-12 rounded-full bg-primary-foreground/10 flex items-center justify-center">
+                <Bot className="h-6 w-6" />
+              </div>
+              <div>
+                <h1 className="text-xl font-bold">Smart Campus Assistant</h1>
+                <p className="text-sm opacity-90">Always here to help</p>
+              </div>
             </div>
-            <div>
-              <h1 className="text-xl font-bold">Smart Campus Assistant</h1>
-              <p className="text-sm opacity-90">Always here to help</p>
-            </div>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+              className="h-10 w-10 rounded-full bg-primary-foreground/10 hover:bg-primary-foreground/20 text-primary-foreground"
+            >
+              <Sun className="h-5 w-5 rotate-0 scale-100 transition-all dark:-rotate-90 dark:scale-0" />
+              <Moon className="absolute h-5 w-5 rotate-90 scale-0 transition-all dark:rotate-0 dark:scale-100" />
+              <span className="sr-only">Toggle theme</span>
+            </Button>
           </div>
         </div>
 
@@ -133,6 +154,7 @@ const Index = () => {
             return null;
           })}
           {isTyping && <TypingIndicator />}
+          <div ref={messagesEndRef} />
         </div>
 
         {/* Input */}
