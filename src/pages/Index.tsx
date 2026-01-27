@@ -9,6 +9,8 @@ import MapPreviewCard from "@/components/chat/MapPreviewCard";
 import FacultyCarousel from "@/components/chat/FacultyCarousel";
 import PlacementChart from "@/components/chat/PlacementChart";
 import ChatInput from "@/components/chat/ChatInput";
+import { AppSidebar } from "@/components/AppSidebar";
+import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 
 interface Message {
   id: string;
@@ -95,72 +97,80 @@ const Index = () => {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-background via-primary-light/10 to-background p-4">
-      <div className="w-full max-w-3xl h-[90vh] rounded-3xl shadow-elevated bg-card border border-border overflow-hidden flex flex-col">
-        {/* Header */}
-        <div className="bg-gradient-to-r from-primary to-primary/90 p-6 text-primary-foreground">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="h-12 w-12 rounded-full bg-primary-foreground/10 flex items-center justify-center">
-                <Bot className="h-6 w-6" />
+    <SidebarProvider defaultOpen={true}>
+      <div className="min-h-screen w-full flex bg-background">
+        <AppSidebar />
+        
+        <div className="flex-1 flex flex-col">
+          {/* Header */}
+          <header className="border-b border-border bg-card/50 backdrop-blur-sm sticky top-0 z-10">
+            <div className="flex items-center justify-between p-4">
+              <div className="flex items-center gap-3">
+                <SidebarTrigger />
+                <div className="flex items-center gap-2">
+                  <Bot className="h-5 w-5 text-primary" />
+                  <h1 className="text-lg font-semibold">Smart Campus Assistant</h1>
+                </div>
               </div>
-              <div>
-                <h1 className="text-xl font-bold">Smart Campus Assistant</h1>
-                <p className="text-sm opacity-90">Always here to help</p>
-              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+                className="h-9 w-9 rounded-lg"
+              >
+                <Sun className="h-4 w-4 rotate-0 scale-100 transition-all dark:-rotate-90 dark:scale-0" />
+                <Moon className="absolute h-4 w-4 rotate-90 scale-0 transition-all dark:rotate-0 dark:scale-100" />
+                <span className="sr-only">Toggle theme</span>
+              </Button>
             </div>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-              className="h-10 w-10 rounded-full bg-primary-foreground/10 hover:bg-primary-foreground/20 text-primary-foreground"
-            >
-              <Sun className="h-5 w-5 rotate-0 scale-100 transition-all dark:-rotate-90 dark:scale-0" />
-              <Moon className="absolute h-5 w-5 rotate-90 scale-0 transition-all dark:rotate-0 dark:scale-100" />
-              <span className="sr-only">Toggle theme</span>
-            </Button>
+          </header>
+
+          {/* Messages */}
+          <div className="flex-1 overflow-y-auto">
+            <div className="max-w-3xl mx-auto p-6 space-y-4">
+              {messages.map((message) => {
+                if (message.type === "text") {
+                  return (
+                    <MessageBubble
+                      key={message.id}
+                      message={message.content || ""}
+                      isUser={message.isUser}
+                    />
+                  );
+                }
+                if (message.type === "quick-reply") {
+                  return (
+                    <QuickReplyButtons
+                      key={message.id}
+                      onSelect={handleQuickReply}
+                    />
+                  );
+                }
+                if (message.type === "map") {
+                  return <MapPreviewCard key={message.id} />;
+                }
+                if (message.type === "faculty") {
+                  return <FacultyCarousel key={message.id} />;
+                }
+                if (message.type === "placements") {
+                  return <PlacementChart key={message.id} />;
+                }
+                return null;
+              })}
+              {isTyping && <TypingIndicator />}
+              <div ref={messagesEndRef} />
+            </div>
+          </div>
+
+          {/* Input */}
+          <div className="border-t border-border bg-card/50 backdrop-blur-sm sticky bottom-0">
+            <div className="max-w-3xl mx-auto p-4">
+              <ChatInput onSend={handleSendMessage} disabled={isTyping} />
+            </div>
           </div>
         </div>
-
-        {/* Chat Messages */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-4">
-          {messages.map((message) => {
-            if (message.type === "text") {
-              return (
-                <MessageBubble
-                  key={message.id}
-                  message={message.content || ""}
-                  isUser={message.isUser}
-                />
-              );
-            }
-            if (message.type === "quick-reply") {
-              return (
-                <QuickReplyButtons
-                  key={message.id}
-                  onSelect={handleQuickReply}
-                />
-              );
-            }
-            if (message.type === "map") {
-              return <MapPreviewCard key={message.id} />;
-            }
-            if (message.type === "faculty") {
-              return <FacultyCarousel key={message.id} />;
-            }
-            if (message.type === "placements") {
-              return <PlacementChart key={message.id} />;
-            }
-            return null;
-          })}
-          {isTyping && <TypingIndicator />}
-          <div ref={messagesEndRef} />
-        </div>
-
-        {/* Input */}
-        <ChatInput onSend={handleSendMessage} disabled={isTyping} />
       </div>
-    </div>
+    </SidebarProvider>
   );
 };
 

@@ -4,22 +4,22 @@ import { Mail, Phone } from "lucide-react";
 const FacultyCarousel = () => {
   const faculty = [
     {
-      name: "Dr. Sarah Johnson",
+      name: "Prof. A",
       department: "Computer Science",
-      email: "s.johnson@campus.edu",
-      phone: "+1 234-567-8901",
+      email: "A@campus.edu",
+      phone: "+91 777-567-8901",
     },
     {
-      name: "Prof. Michael Chen",
-      department: "Data Science",
-      email: "m.chen@campus.edu",
-      phone: "+1 234-567-8902",
+      name: "Prof. B",
+      department: "Electrical",
+      email: "B@campus.edu",
+      phone: "+91 777-567-8902",
     },
     {
-      name: "Dr. Emily Williams",
-      department: "Software Engineering",
-      email: "e.williams@campus.edu",
-      phone: "+1 234-567-8903",
+      name: "Dr. C",
+      department: "Electrical",
+      email: "C@campus.edu",
+      phone: "+91 777-567-8903",
     },
   ];
 
