@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import json
+import re
 from langchain_community.chat_models import ChatOllama
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -8,7 +9,6 @@ from langchain_community.utilities import SQLDatabase
 from langchain_core.messages import HumanMessage, ToolMessage, SystemMessage, AIMessage
 
 # 1. CONFIGURATION
-# No API Keys needed! We are running locally.
 MODEL_NAME = "llama3" 
 
 # 2. CONNECT TO DATABASES
@@ -18,50 +18,76 @@ vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embedding
 
 # 3. DEFINE THE TOOLS
 def pdf_search(query):
-    """Retrieves text from the PDFs in the folder."""
-    print(f"   (Searching PDF for: {query})...")
-    docs = vector_db.similarity_search(query, k=3)
-    return "\n\n".join([d.page_content for d in docs])
+    """Retrieves text from PDFs with a manual keyword re-ranker."""
+    print(f"   🔍 Searching PDF Database for: '{query}'...")
+    raw_docs = vector_db.similarity_search(query, k=10)
+    
+    match = re.search(r'Block\s+([A-Z])', query, re.IGNORECASE)
+    target_identifier = f"Block {match.group(1).upper()}" if match else None
+    
+    prioritized_docs = []
+    other_docs = []
+    for d in raw_docs:
+        content = d.page_content.upper()
+        if target_identifier and target_identifier.upper() in content:
+            prioritized_docs.append(d)
+        else:
+            other_docs.append(d)
+    
+    final_docs = (prioritized_docs + other_docs)[:5]
+    context_list = []
+    for d in final_docs:
+        source = os.path.basename(d.metadata.get('source', 'Unknown File'))
+        context_list.append(f"[Source: {source}]\n{d.page_content}")
+    
+    return "\n\n---\n\n".join(context_list)
 
 def sql_query(query):
     """Runs a query against the SQL database."""
-    print(f"   (Running SQL: {query})...")
+    print(f"   🗄️  Running SQL Query: {query}...")
     try:
+        # Clean potential markdown or extra words from the AI
         clean_query = query.replace("```sql", "").replace("```", "").strip()
         result = db.run(clean_query)
-        return str(result) if result else "No matching records found."
+        return str(result) if result else "No matching records found in SQL."
     except Exception as e:
         return f"SQL Error: {str(e)}"
 
-# 4. INITIALIZE OLLAMA (Local AI)
+# 4. INITIALIZE OLLAMA
 llm = ChatOllama(model=MODEL_NAME, temperature=0)
 
-tools_map = {"PDF_Knowledge_Base": pdf_search, "Campus_SQL_Data": sql_query}
+# Add aliases to tools_map to handle Llama 3's tendency to simplify tool names
+tools_map = {
+    "PDF_Knowledge_Base": pdf_search,
+    "Campus_SQL_Data": sql_query,
+    "SQL": sql_query,        # Alias for resilience
+    "PDF": pdf_search        # Alias for resilience
+}
 
 # 5. THE CHAT LOOP
 def chat():
     print("\n" + "="*50)
     print(f"🤖 VJTI Bot (Local {MODEL_NAME}) is Online!")
-    print("Zero cost. Unlimited queries.")
+    print("Resilient SQL/PDF Routing Logic Enabled.")
     print("Type 'exit' to quit.")
     print("="*50)
     
-    # We use a Prompt-Based Tool Calling approach because bind_tools is not supported by ChatOllama yet
     system_instruction = """You are the VJTI Smart Campus Assistant.
-You have access to two tools:
-1. "PDF_Knowledge_Base": Useful for questions about FEES, HOSTEL RULES, CALENDARS, POLICIES, and ADMISSION DOCS. Input should be a search phrase.
-2. "Campus_SQL_Data": Useful for specific FACTS like FACULTY names, CUTOFFS, INTAKE, and ROOM locations. Input should be a valid SQL query for SQLite. 
-   - Database Tables: 
-     - faculty (name, department, designation, email, cabin_location)
-     - placements (year, company, branch, package_lpa)
-     - locations (name, latitude, longitude, floor_info)
-     - programs (program_name, intake, department)
-     - cutoffs (year, branch, category, percentile)
 
-To use a tool, you MUST respond with ONLY a JSON object in this exact format:
-{"tool": "tool_name", "query": "your_query"}
+ROUTING PRIORITY (CRITICAL):
+- Use 'Campus_SQL_Data' (or simply 'SQL') for: ANY lists of programs, student intake numbers, faculty locations, and cutoffs.
+- Use 'PDF_Knowledge_Base' (or simply 'PDF') for: Fees, hostel rules, calendars, and academic policies.
+- If a question asks for "How many", "List all", or "Compare", it is ALWAYS a SQL query.
 
-If you do not need a tool, answer normally.
+SQL RULES:
+- You MUST write a VALID SQLite query.
+- Table 'programs' has: program_name, level, department, intake, duration_years.
+- To find M.Tech: SELECT program_name, intake FROM programs WHERE level = 'Postgraduate' AND program_name LIKE 'M.Tech%';
+- Table 'cutoffs' has: year, branch, category, percentile.
+- Table 'faculty' has: name, department, designation, email, cabin_location.
+
+TO USE A TOOL, respond ONLY with this JSON format:
+{"tool": "Campus_SQL_Data", "query": "SELECT ..."}
 """
     messages = [SystemMessage(content=system_instruction)]
 
@@ -73,49 +99,34 @@ If you do not need a tool, answer normally.
                 
             messages.append(HumanMessage(content=user_input))
             
-            # 1. Get AI Response
             response = llm.invoke(messages)
             content = response.content.strip()
             
-            # 2. Check if AI returned a JSON tool call
-            # We look for the start/end of a JSON block
-            if "{" in content and "}" in content and '"tool":' in content:
+            # Use RegEx to find JSON anywhere in the response
+            json_match = re.search(r'\{.*"tool":\s*"(.*?)",\s*"query":\s*"(.*?)"\s*\}', content, re.DOTALL)
+            
+            if json_match:
                 try:
-                    # Extract JSON string even if there is extra text
-                    start = content.find("{")
-                    end = content.rfind("}") + 1
-                    json_str = content[start:end]
-                    
-                    tool_call = json.loads(json_str)
-                    tool_name = tool_call.get("tool")
-                    query_arg = tool_call.get("query")
+                    tool_call_json = json.loads(json_match.group(0))
+                    tool_name = tool_call_json.get("tool")
+                    query_arg = tool_call_json.get("query")
                     
                     if tool_name in tools_map:
                         print(f"⚙️  Executing {tool_name}...")
-                        
-                        # Execute Tool
                         result = tools_map[tool_name](query_arg)
                         
-                        # Append the interaction to history so Llama knows what happened
-                        messages.append(AIMessage(content=json_str))
-                        messages.append(HumanMessage(content=f"Tool Output: {result}\n\nBased on this output, provide the final answer to the user."))
+                        messages.append(AIMessage(content=content))
+                        messages.append(HumanMessage(content=f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: Based ONLY on this data, provide the final answer. Use a table for lists/intakes."))
                         
-                        # 3. Get Final Answer
                         final_response = llm.invoke(messages)
                         print(f"\nBot: {final_response.content}")
                         messages.append(final_response)
-                        
                     else:
-                        print(f"\nBot: {content}") # Just print if tool name is wrong
-                        messages.append(response)
-                        
-                except json.JSONDecodeError:
-                    # If JSON parsing fails, just print the raw response
+                        print(f"\nBot: [Internal Error] Invalid tool: {tool_name}")
+                        print(f"   (Hint: The model used '{tool_name}' which is not in {list(tools_map.keys())})")
+                except Exception as e:
                     print(f"\nBot: {content}")
-                    messages.append(response)
-            
             else:
-                # Normal response (no tool needed)
                 print(f"\nBot: {content}")
                 messages.append(response)
 
