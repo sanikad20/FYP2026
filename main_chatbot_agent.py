@@ -18,23 +18,34 @@ vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embedding
 
 # 3. DEFINE THE TOOLS
 def pdf_search(query):
-    """Retrieves text from PDFs with a manual keyword re-ranker."""
+    """Retrieves text from PDFs with an enhanced keyword re-ranker for Blocks and PG-Hostel."""
     print(f"   🔍 Searching PDF Database for: '{query}'...")
-    raw_docs = vector_db.similarity_search(query, k=10)
+    # Fetch 12 chunks for better coverage of multi-floor descriptions
+    raw_docs = vector_db.similarity_search(query, k=12)
     
-    match = re.search(r'Block\s+([A-Z])', query, re.IGNORECASE)
-    target_identifier = f"Block {match.group(1).upper()}" if match else None
+    # --- ENHANCED SELECTOR LOGIC ---
+    # Detect specific targets: Block [Letter] or PG Hostel/Postgraduate
+    block_match = re.search(r'Block\s+([A-Z])', query, re.IGNORECASE)
+    pg_match = re.search(r'(PG|Postgraduate)\s*Hostel', query, re.IGNORECASE)
+    
+    target_identifiers = []
+    if block_match:
+        target_identifiers.append(f"Block {block_match.group(1).upper()}")
+    if pg_match:
+        target_identifiers.extend(["PG-HOSTEL", "PG HOSTEL", "POSTGRADUATE HOSTEL"])
     
     prioritized_docs = []
     other_docs = []
     for d in raw_docs:
         content = d.page_content.upper()
-        if target_identifier and target_identifier.upper() in content:
+        # Prioritize if any specific target identifier is found in the chunk
+        if target_identifiers and any(tid.upper() in content for tid in target_identifiers):
             prioritized_docs.append(d)
         else:
             other_docs.append(d)
     
-    final_docs = (prioritized_docs + other_docs)[:5]
+    # Re-assemble: Prioritized docs first, limit to top 6 chunks for the model
+    final_docs = (prioritized_docs + other_docs)[:6]
     context_list = []
     for d in final_docs:
         source = os.path.basename(d.metadata.get('source', 'Unknown File'))
@@ -68,23 +79,35 @@ tools_map = {
 def chat():
     print("\n" + "="*50)
     print(f"🤖 VJTI Bot (Local {MODEL_NAME}) is Online!")
-    print("Resilient SQL/PDF Routing Logic Enabled.")
+    print("Demo-Ready Mode Enabled (Fixed Cutoffs & Hostels).")
     print("Type 'exit' to quit.")
     print("="*50)
     
     system_instruction = """You are the VJTI Smart Campus Assistant.
 
 ROUTING PRIORITY (CRITICAL):
-- Use 'Campus_SQL_Data' (or simply 'SQL') for: ANY lists of programs, student intake numbers, faculty locations, and cutoffs.
-- Use 'PDF_Knowledge_Base' (or simply 'PDF') for: Fees, hostel rules, calendars, and academic policies.
-- If a question asks for "How many", "List all", or "Compare", it is ALWAYS a SQL query.
+- Use 'Campus_SQL_Data' (or simply 'SQL') for: Lists of programs, intake numbers, faculty locations, HOD names, and cutoffs.
+- Use 'PDF_Knowledge_Base' (or simply 'PDF') for: Hostel structure, room counts, fees, and policies.
+- CRITICAL: Hostel "Block C" structure is ONLY in the PDF. NEVER use SQL for hostels.
 
-SQL RULES:
-- You MUST write a VALID SQLite query.
-- Table 'programs' has: program_name, level, department, intake, duration_years.
-- To find M.Tech: SELECT program_name, intake FROM programs WHERE level = 'Postgraduate' AND program_name LIKE 'M.Tech%';
-- Table 'cutoffs' has: year, branch, category, percentile.
-- Table 'faculty' has: name, department, designation, email, cabin_location.
+SQL RULES (STRICT SCHEMA MAPPING):
+1. 'cutoffs' Table: Columns are [year, branch, category, percentile]. NEVER use 'program' or 'program_name' in this table.
+2. 'programs' Table: Columns are [program_name, level, department, intake, duration_years].
+   - For M.Tech, level = 'Postgraduate'.
+   - For B.Tech, level = 'Undergraduate'.
+3. 'faculty' Table: Columns are [name, department, designation, email, cabin_location].
+   - Computer HOD search: WHERE designation LIKE '%HOD%' AND department LIKE '%Computer%'.
+
+DEMO QUESTION TEMPLATES:
+- M.Tech Intakes: SELECT program_name, intake FROM programs WHERE level = 'Postgraduate' AND program_name LIKE 'M.Tech%';
+- Cutoff Comparison: SELECT year, percentile FROM cutoffs WHERE branch = 'Computer Engineering' AND category = 'GOPENS' AND (year=2024 OR year=2025);
+- B.Tech Intake: SELECT intake FROM programs WHERE program_name = 'B.Tech Computer Engineering';
+
+PDF RULES (STRICT GROUNDING):
+- You MUST answer ONLY based on the provided TOOL OUTPUT.
+- Do NOT use internal knowledge for hostel room counts or floor structures.
+- If data for a specific building is found in the TOOL OUTPUT, report it exactly.
+- If data is missing from the TOOL OUTPUT, say 'I don't have that specific info'. DO NOT hallucinate numbers.
 
 TO USE A TOOL, respond ONLY with this JSON format:
 {"tool": "Campus_SQL_Data", "query": "SELECT ..."}
@@ -115,15 +138,20 @@ TO USE A TOOL, respond ONLY with this JSON format:
                         print(f"⚙️  Executing {tool_name}...")
                         result = tools_map[tool_name](query_arg)
                         
+                        # Determine follow-up instruction based on the tool used
+                        if tool_name in ["Campus_SQL_Data", "SQL"]:
+                            final_task_note = "For cutoffs/intakes, use a clear Markdown table."
+                        else:
+                            final_task_note = "For Hostels, report the floor-by-floor room counts exactly as written in the text. Cite the source."
+
                         messages.append(AIMessage(content=content))
-                        messages.append(HumanMessage(content=f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: Based ONLY on this data, provide the final answer. Use a table for lists/intakes."))
+                        messages.append(HumanMessage(content=f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: Using ONLY this data, answer the original user query: '{user_input}'. {final_task_note}"))
                         
                         final_response = llm.invoke(messages)
                         print(f"\nBot: {final_response.content}")
                         messages.append(final_response)
                     else:
                         print(f"\nBot: [Internal Error] Invalid tool: {tool_name}")
-                        print(f"   (Hint: The model used '{tool_name}' which is not in {list(tools_map.keys())})")
                 except Exception as e:
                     print(f"\nBot: {content}")
             else:
