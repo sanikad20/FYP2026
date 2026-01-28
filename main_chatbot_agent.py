@@ -2,14 +2,16 @@ import os
 import sqlite3
 import json
 import re
+import webbrowser # For opening files during local demo
 from langchain_community.chat_models import ChatOllama
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_community.utilities import SQLDatabase
-from langchain_core.messages import HumanMessage, ToolMessage, SystemMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 # 1. CONFIGURATION
 MODEL_NAME = "llama3" 
+DOCS_FOLDER = "./campus_documents"
 
 # 2. CONNECT TO DATABASES
 db = SQLDatabase.from_uri("sqlite:///campus.db")
@@ -18,38 +20,44 @@ vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embedding
 
 # 3. DEFINE THE TOOLS
 def pdf_search(query):
-    """Retrieves text from PDFs with an enhanced keyword re-ranker for Blocks and PG-Hostel."""
+    """Retrieves text from PDFs and tracks file paths for the attachment feature."""
     print(f"   🔍 Searching PDF Database for: '{query}'...")
-    # Fetch 12 chunks for better coverage of multi-floor descriptions
-    raw_docs = vector_db.similarity_search(query, k=12)
+    raw_docs = vector_db.similarity_search(query, k=15)
     
-    # --- ENHANCED SELECTOR LOGIC ---
-    # Detect specific targets: Block [Letter] or PG Hostel/Postgraduate
+    # --- DEBUG: SHOW RETRIEVED SOURCES IN TERMINAL ---
+    retrieved_sources = list(set([os.path.basename(d.metadata.get('source', 'Unknown')) for d in raw_docs]))
+    print(f"   📂 Retrieved Chunks from: {retrieved_sources}")
+    
+    # --- ENHANCED KEYWORD RE-RANKER ---
     block_match = re.search(r'Block\s+([A-Z])', query, re.IGNORECASE)
     pg_match = re.search(r'(PG|Postgraduate)\s*Hostel', query, re.IGNORECASE)
-    
-    target_identifiers = []
-    if block_match:
-        target_identifiers.append(f"Block {block_match.group(1).upper()}")
-    if pg_match:
-        target_identifiers.extend(["PG-HOSTEL", "PG HOSTEL", "POSTGRADUATE HOSTEL"])
+    fee_match = re.search(r'(Fee|Tuition|TFWS|Refund|Amount|Deposit|Open)', query, re.IGNORECASE)
     
     prioritized_docs = []
     other_docs = []
+    
     for d in raw_docs:
         content = d.page_content.upper()
-        # Prioritize if any specific target identifier is found in the chunk
-        if target_identifiers and any(tid.upper() in content for tid in target_identifiers):
+        source_name = os.path.basename(d.metadata.get('source', '')).upper()
+        
+        is_priority = False
+        if block_match and f"BLOCK {block_match.group(1).upper()}" in content:
+            is_priority = True
+        elif pg_match and ("PG-HOSTEL" in content or "PG HOSTEL" in content or "POSTGRADUATE" in content):
+            is_priority = True
+        elif fee_match and "FEES_" in source_name:
+            is_priority = True
+            
+        if is_priority:
             prioritized_docs.append(d)
         else:
             other_docs.append(d)
     
-    # Re-assemble: Prioritized docs first, limit to top 6 chunks for the model
-    final_docs = (prioritized_docs + other_docs)[:6]
+    final_docs = (prioritized_docs + other_docs)[:8]
     context_list = []
     for d in final_docs:
         source = os.path.basename(d.metadata.get('source', 'Unknown File'))
-        context_list.append(f"[Source: {source}]\n{d.page_content}")
+        context_list.append(f"[OFFICIAL SOURCE: {source}]\n{d.page_content}")
     
     return "\n\n---\n\n".join(context_list)
 
@@ -57,7 +65,6 @@ def sql_query(query):
     """Runs a query against the SQL database."""
     print(f"   🗄️  Running SQL Query: {query}...")
     try:
-        # Clean potential markdown or extra words from the AI
         clean_query = query.replace("```sql", "").replace("```", "").strip()
         result = db.run(clean_query)
         return str(result) if result else "No matching records found in SQL."
@@ -67,19 +74,18 @@ def sql_query(query):
 # 4. INITIALIZE OLLAMA
 llm = ChatOllama(model=MODEL_NAME, temperature=0)
 
-# Add aliases to tools_map to handle Llama 3's tendency to simplify tool names
 tools_map = {
     "PDF_Knowledge_Base": pdf_search,
     "Campus_SQL_Data": sql_query,
-    "SQL": sql_query,        # Alias for resilience
-    "PDF": pdf_search        # Alias for resilience
+    "SQL": sql_query,
+    "PDF": pdf_search
 }
 
 # 5. THE CHAT LOOP
 def chat():
     print("\n" + "="*50)
     print(f"🤖 VJTI Bot (Local {MODEL_NAME}) is Online!")
-    print("Demo-Ready Mode Enabled (Fixed Cutoffs & Hostels).")
+    print("Verification Mode: Check Terminal for Source Document IDs.")
     print("Type 'exit' to quit.")
     print("="*50)
     
@@ -91,12 +97,16 @@ ROUTING PRIORITY (CRITICAL):
 - CRITICAL: Hostel "Block C" structure is ONLY in the PDF. NEVER use SQL for hostels.
 
 SQL RULES (STRICT SCHEMA MAPPING):
-1. 'cutoffs' Table: Columns are [year, branch, category, percentile]. NEVER use 'program' or 'program_name' in this table.
-2. 'programs' Table: Columns are [program_name, level, department, intake, duration_years].
+1. MANDATORY LIKE: For ALL string filters (department, branch, name, designation), you MUST use `LIKE '%keyword%'` instead of `=`. 
+2. KEYWORD ISOLATION: When the user says 'Electrical dept' or 'Computer branch', use ONLY the core noun (e.g., '%Electrical%' or '%Computer%') for the LIKE pattern. Ignore words like 'dept', 'department', 'branch', 'course', 'office'.
+3. 'cutoffs' Table: Columns are [year, branch, category, percentile]. NEVER use 'program' or 'program_name' in this table.
+4. 'programs' Table: Columns are [program_name, level, department, intake, duration_years].
    - For M.Tech, level = 'Postgraduate'.
    - For B.Tech, level = 'Undergraduate'.
-3. 'faculty' Table: Columns are [name, department, designation, email, cabin_location].
-   - Computer HOD search: WHERE designation LIKE '%HOD%' AND department LIKE '%Computer%'.
+5. 'faculty' Table: Columns are [name, department, designation, email, cabin_location].
+   - ALWAYS use `LIKE '%HOD%'` for any query related to "HOD", "Head", or "Head of Department". NEVER use long-form strings.
+   - HOD Search Example: WHERE designation LIKE '%HOD%' AND department LIKE '%Computer%'.
+   - SYNONYM MAPPING: 'mail' or 'email' -> use `email` column; 'office' or 'room' -> use `cabin_location`.
 
 DEMO QUESTION TEMPLATES:
 - M.Tech Intakes: SELECT program_name, intake FROM programs WHERE level = 'Postgraduate' AND program_name LIKE 'M.Tech%';
@@ -105,9 +115,13 @@ DEMO QUESTION TEMPLATES:
 
 PDF RULES (STRICT GROUNDING):
 - You MUST answer ONLY based on the provided TOOL OUTPUT.
-- Do NOT use internal knowledge for hostel room counts or floor structures.
-- If data for a specific building is found in the TOOL OUTPUT, report it exactly.
-- If data is missing from the TOOL OUTPUT, say 'I don't have that specific info'. DO NOT hallucinate numbers.
+- DO NOT GUESS NUMBERS. If data is missing from the output, say 'I don't have that info'.
+- When answering from a PDF, YOU MUST CITE the filename from the [OFFICIAL SOURCE] tag.
+
+FEE POLICY (CRITICAL):
+- For any questions regarding tuition fees, development fees, or total annual amounts, DO NOT state any numerical figures or currency amounts.
+- Inform the user that the fee structure is complex due to various categories (Open, Reserved, TFWS).
+- Direct the user to cross-verify the details using the specific PDF file provided in your response.
 
 TO USE A TOOL, respond ONLY with this JSON format:
 {"tool": "Campus_SQL_Data", "query": "SELECT ..."}
@@ -125,7 +139,6 @@ TO USE A TOOL, respond ONLY with this JSON format:
             response = llm.invoke(messages)
             content = response.content.strip()
             
-            # Use RegEx to find JSON anywhere in the response
             json_match = re.search(r'\{.*"tool":\s*"(.*?)",\s*"query":\s*"(.*?)"\s*\}', content, re.DOTALL)
             
             if json_match:
@@ -135,20 +148,28 @@ TO USE A TOOL, respond ONLY with this JSON format:
                     query_arg = tool_call_json.get("query")
                     
                     if tool_name in tools_map:
-                        print(f"⚙️  Executing {tool_name}...")
                         result = tools_map[tool_name](query_arg)
                         
-                        # Determine follow-up instruction based on the tool used
                         if tool_name in ["Campus_SQL_Data", "SQL"]:
                             final_task_note = "For cutoffs/intakes, use a clear Markdown table."
                         else:
-                            final_task_note = "For Hostels, report the floor-by-floor room counts exactly as written in the text. Cite the source."
+                            final_task_note = "REMINDER: For fee queries, do not state numbers. Provide the official filename for cross-verification. For Hostels, report the exact structure found."
 
                         messages.append(AIMessage(content=content))
-                        messages.append(HumanMessage(content=f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: Using ONLY this data, answer the original user query: '{user_input}'. {final_task_note}"))
+                        messages.append(HumanMessage(content=f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: Based ONLY on this data, answer: '{user_input}'. {final_task_note}"))
                         
                         final_response = llm.invoke(messages)
-                        print(f"\nBot: {final_response.content}")
+                        bot_text = final_response.content
+                        
+                        # --- PDF ATTACHMENT LOGIC ---
+                        source_match = re.search(r'([A-Za-z0-9_-]+\.pdf)', bot_text)
+                        attachment_msg = ""
+                        if source_match:
+                            filename = source_match.group(1)
+                            full_path = os.path.join(DOCS_FOLDER, filename)
+                            attachment_msg = f"\n\n📎 [Attachment Found: {filename}]\n> Location: {full_path}\n> (You can verify this document in your campus_documents folder)"
+                        
+                        print(f"\nBot: {bot_text}{attachment_msg}")
                         messages.append(final_response)
                     else:
                         print(f"\nBot: [Internal Error] Invalid tool: {tool_name}")

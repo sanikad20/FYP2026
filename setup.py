@@ -344,7 +344,6 @@ def create_database():
 ]
     cursor.executemany('INSERT INTO faculty (name, department, designation, email) VALUES (?, ?, ?, ?)', faculty_data)
     
-
     # --- 4. Location Data ---
     location_data = [
         # Buildings (Lat/Long required)
