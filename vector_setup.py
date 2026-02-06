@@ -46,7 +46,7 @@ def create_vector_store():
     # 4. CREATE & PERSIST VECTOR DB
     print("🔄 Generating Google Embeddings and updating Vector Database...")
     
-    # Use GoogleGenerativeAIEmbeddings instead of OpenAI
+    # Hugging face
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     
     vector_db = Chroma.from_documents(

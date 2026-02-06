@@ -10,7 +10,7 @@ from langchain_community.utilities import SQLDatabase
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 # 1. CONFIGURATION
-MODEL_NAME = "llama3" 
+MODEL_NAME = "llama3"
 DOCS_FOLDER = "./campus_documents"
 
 # 2. CONNECT TO DATABASES
@@ -97,13 +97,30 @@ ROUTING PRIORITY (CRITICAL):
 - CRITICAL: Hostel "Block C" structure is ONLY in the PDF. NEVER use SQL for hostels.
 
 SQL RULES (STRICT SCHEMA MAPPING):
-1. 'cutoffs' Table: Columns are [year, branch, category, percentile]. NEVER use 'program' or 'program_name' in this table.
-2. 'programs' Table: Columns are [program_name, level, department, intake, duration_years].
-   - For M.Tech, level = 'Postgraduate'.
-   - For B.Tech, level = 'Undergraduate'.
-3. 'faculty' Table: Columns are [name, department, designation, email, cabin_location].
-   - ALWAYS use LIKE '%keyword%' for the 'department' column to ensure partial matches (e.g., searching for 'Electrical' should use department LIKE '%Electrical%' to match 'Electrical Engineering').
-   - HOD search: WHERE designation LIKE '%HOD%' AND department LIKE '%Computer%'.
+1. MANDATORY LIKE: For ALL string filters (department, branch, name, designation), you MUST use `LIKE '%keyword%'` instead of `=`. 
+2. KEYWORD ISOLATION: When the user says 'Electrical dept' or 'Computer branch', use ONLY the core noun (e.g., '%Electrical%' or '%Computer%') for the LIKE pattern. Ignore words like 'dept', 'department', 'branch', 'course', 'office'.
+3. SYNONYM MAPPING (CRITICAL):
+- 'IT' and 'Information Technology' -> MUST be treated as identical. Always search for `%Information Technology%` if the user says 'IT'.
+- 'Entc' or 'Extc' or 'Electronics and telecommunication' or 'telecommunication' and 'Electronics & Telecom' -> MUST be treated as identical. Always search for `%Electronics & Telecom%` if the user says 'Entc' or 'Extc' or 'Electronics and telecommunication' or 'telecommunication'.
+- 'mail' or 'email' -> use `email` column; 'office' or 'room' -> use `cabin_location`.
+
+4. 'cutoffs' Table: Columns are [year, branch, category, percentile].
+    - MANDATORY SELECT: ALWAYS include the `category` column in the SELECT clause when querying cutoffs so the user can see which category the score belongs to.
+    - CATEGORY CODES (CRITICAL): The database uses codes. 
+     * 'Open' or 'General' -> use LIKE '%OPENS%'.
+     * 'OBC' -> use LIKE '%OBCS%'.
+     * 'SC' -> use LIKE '%SCS%'.
+     * 'ST' -> use LIKE '%STS%'.
+     * 'EWS' or 'Economically Weaker Section'  -> use LIKE '%EWS%'.
+    - If user asks for 'all categories', DO NOT filter by category. Simply use: SELECT category, percentile FROM cutoffs WHERE branch LIKE '%keyword%' AND year = 2025;
+
+5. 'programs' Table: Columns are [program_name, level, department, intake, duration_years].
+    - For M.Tech, level = 'Postgraduate'.
+    - For B.Tech, level = 'Undergraduate'.
+
+6. 'faculty' Table: Columns are [name, department, designation, email, cabin_location].
+    - ALWAYS use `LIKE '%HOD%'` for any query related to "HOD", "Head", or "Head of Department". NEVER use long-form strings.
+    - HOD Search Example: WHERE designation LIKE '%HOD%' AND department LIKE '%Computer%'. 
 
 DEMO QUESTION TEMPLATES:
 - M.Tech Intakes: SELECT program_name, intake FROM programs WHERE level = 'Postgraduate' AND program_name LIKE 'M.Tech%';

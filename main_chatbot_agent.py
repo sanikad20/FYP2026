@@ -2,7 +2,7 @@ import os
 import sqlite3
 import json
 import re
-import webbrowser # For opening files during local demo
+import webbrowser
 from langchain_community.chat_models import ChatOllama
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -65,6 +65,7 @@ def sql_query(query):
     """Runs a query against the SQL database."""
     print(f"   🗄️  Running SQL Query: {query}...")
     try:
+        # Clean potential markdown or extra words from the AI
         clean_query = query.replace("```sql", "").replace("```", "").strip()
         result = db.run(clean_query)
         return str(result) if result else "No matching records found in SQL."
@@ -85,7 +86,7 @@ tools_map = {
 def chat():
     print("\n" + "="*50)
     print(f"🤖 VJTI Bot (Local {MODEL_NAME}) is Online!")
-    print("Verification Mode: Check Terminal for Source Document IDs.")
+    print("Strict Category Mapping & Mandatory Display logic Active.")
     print("Type 'exit' to quit.")
     print("="*50)
     
@@ -97,20 +98,39 @@ ROUTING PRIORITY (CRITICAL):
 - CRITICAL: Hostel "Block C" structure is ONLY in the PDF. NEVER use SQL for hostels.
 
 SQL RULES (STRICT SCHEMA MAPPING):
+
+INDEPENDENT COLUMN SELECTION: For every new query, evaluate exactly which columns the user wants. DO NOT carry over columns from previous questions. 
 1. MANDATORY LIKE: For ALL string filters (department, branch, name, designation), you MUST use `LIKE '%keyword%'` instead of `=`. 
 2. KEYWORD ISOLATION: When the user says 'Electrical dept' or 'Computer branch', use ONLY the core noun (e.g., '%Electrical%' or '%Computer%') for the LIKE pattern. Ignore words like 'dept', 'department', 'branch', 'course', 'office'.
-3. 'cutoffs' Table: Columns are [year, branch, category, percentile]. NEVER use 'program' or 'program_name' in this table.
-4. 'programs' Table: Columns are [program_name, level, department, intake, duration_years].
-   - For M.Tech, level = 'Postgraduate'.
-   - For B.Tech, level = 'Undergraduate'.
-5. 'faculty' Table: Columns are [name, department, designation, email, cabin_location].
-   - ALWAYS use `LIKE '%HOD%'` for any query related to "HOD", "Head", or "Head of Department". NEVER use long-form strings.
-   - HOD Search Example: WHERE designation LIKE '%HOD%' AND department LIKE '%Computer%'.
-   - SYNONYM MAPPING: 'mail' or 'email' -> use `email` column; 'office' or 'room' -> use `cabin_location`.
+3. SYNONYM MAPPING (CRITICAL):
+- 'IT' and 'Information Technology' -> MUST be treated as identical. Always search for `%Information Technology%` if the user says 'IT'.
+- 'Entc' or 'Extc' or 'Electronics and telecommunication' or 'telecommunication' and 'Electronics & Telecom' -> MUST be treated as identical. Always search for `%Electronics & Telecom%` if the user says 'Entc' or 'Extc' or 'Electronics and telecommunication' or 'telecommunication'.
+- 'mail' or 'email' -> use `email` column; 'office' or 'room' -> use `cabin_location`.
+- 'Electronics' vs 'EXTC': 
+    * If the user says 'Electronics' (without 'EXTC' or 'Telecom'), search for branch LIKE '%Electronics Engineering%'.
+    * If the user says 'EXTC', 'ENTC', or 'Telecommunication', search for branch LIKE '%Electronics & Telecom%'.
+
+4. 'cutoffs' Table: Columns are [year, branch, category, percentile].
+    - MANDATORY SELECT: ALWAYS include the `category` column in the SELECT clause when querying cutoffs so the user can see which category the score belongs to.
+    - CATEGORY CODES (CRITICAL): The database uses codes. 
+     * 'Open' or 'General' -> use LIKE '%OPENS%'.
+     * 'OBC' -> use LIKE '%OBCS%'.
+     * 'SC' -> use LIKE '%SCS%'.
+     * 'ST' -> use LIKE '%STS%'.
+     * 'EWS' or 'Economically Weaker Section'  -> use LIKE '%EWS%'.
+    - If user asks for 'all categories', DO NOT filter by category. Simply use: SELECT category, percentile FROM cutoffs WHERE branch LIKE '%keyword%' AND year = 2025;
+
+5. 'programs' Table: Columns are [program_name, level, department, intake, duration_years].
+    - For M.Tech, level = 'Postgraduate'.
+    - For B.Tech, level = 'Undergraduate'.
+
+6. 'faculty' Table: Columns are [name, department, designation, email, cabin_location].
+    - ALWAYS use `LIKE '%HOD%'` for any query related to "HOD", "Head", or "Head of Department". NEVER use long-form strings.
+    - HOD Search Example: WHERE designation LIKE '%HOD%' AND department LIKE '%Computer%'.
 
 DEMO QUESTION TEMPLATES:
 - M.Tech Intakes: SELECT program_name, intake FROM programs WHERE level = 'Postgraduate' AND program_name LIKE 'M.Tech%';
-- Cutoff Comparison: SELECT year, percentile FROM cutoffs WHERE branch = 'Computer Engineering' AND category = 'GOPENS' AND (year=2024 OR year=2025);
+- Cutoff Comparison: SELECT year, category, percentile FROM cutoffs WHERE branch = 'Computer Engineering' AND category = 'GOPENS' AND (year=2024 OR year=2025);
 - B.Tech Intake: SELECT intake FROM programs WHERE program_name = 'B.Tech Computer Engineering';
 
 PDF RULES (STRICT GROUNDING):
@@ -148,12 +168,13 @@ TO USE A TOOL, respond ONLY with this JSON format:
                     query_arg = tool_call_json.get("query")
                     
                     if tool_name in tools_map:
+                        print(f"⚙️  Executing {tool_name}...")
                         result = tools_map[tool_name](query_arg)
                         
                         if tool_name in ["Campus_SQL_Data", "SQL"]:
-                            final_task_note = "For cutoffs/intakes, use a clear Markdown table."
+                            final_task_note = "CRITICAL: Ensure your Markdown table includes the 'category' column. If it is missing from the data, explain why."
                         else:
-                            final_task_note = "REMINDER: For fee queries, do not state numbers. Provide the official filename for cross-verification. For Hostels, report the exact structure found."
+                            final_task_note = "REMINDER: For fee queries, do not state numbers. Provide the official filename for cross-verification."
 
                         messages.append(AIMessage(content=content))
                         messages.append(HumanMessage(content=f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: Based ONLY on this data, answer: '{user_input}'. {final_task_note}"))
