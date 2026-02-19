@@ -20,18 +20,20 @@ vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embedding
 
 # 3. DEFINE THE TOOLS
 def pdf_search(query):
-    """Retrieves text from PDFs and tracks file paths for the attachment feature."""
+    """Retrieves text from PDFs with an enhanced re-ranker for structural data."""
     print(f"   🔍 Searching PDF Database for: '{query}'...")
+    # k=15 gives a wide net for similarity before we re-rank
     raw_docs = vector_db.similarity_search(query, k=15)
     
-    # --- DEBUG: SHOW RETRIEVED SOURCES IN TERMINAL ---
+    # --- DEBUG: SHOW RETRIEVED SOURCES ---
     retrieved_sources = list(set([os.path.basename(d.metadata.get('source', 'Unknown')) for d in raw_docs]))
     print(f"   📂 Retrieved Chunks from: {retrieved_sources}")
     
     # --- ENHANCED KEYWORD RE-RANKER ---
-    block_match = re.search(r'Block\s+([A-Z])', query, re.IGNORECASE)
-    pg_match = re.search(r'(PG|Postgraduate)\s*Hostel', query, re.IGNORECASE)
-    fee_match = re.search(r'(Fee|Tuition|TFWS|Refund|Amount|Deposit|Open)', query, re.IGNORECASE)
+    # We look for terms that indicate structural hostel data or target groups
+    target_match = re.search(r'(Target|Group|B.Tech|Diploma|First Year|FY|Exclusively)', query, re.IGNORECASE)
+    structure_match = re.search(r'(Floor|Structure|Room|Capacity|Occupancy|Seater|Ground)', query, re.IGNORECASE)
+    fee_match = re.search(r'(Fee|Tuition|Mess|Payment|SBI|Contractor)', query, re.IGNORECASE)
     
     prioritized_docs = []
     other_docs = []
@@ -41,11 +43,12 @@ def pdf_search(query):
         source_name = os.path.basename(d.metadata.get('source', '')).upper()
         
         is_priority = False
-        if block_match and f"BLOCK {block_match.group(1).upper()}" in content:
+        # Check for matching structural or target group keywords in the chunk content
+        if target_match and any(word.upper() in content for word in ["TARGET", "B.TECH", "DIPLOMA", "EXCLUSIVELY"]):
             is_priority = True
-        elif pg_match and ("PG-HOSTEL" in content or "PG HOSTEL" in content or "POSTGRADUATE" in content):
+        elif structure_match and any(word.upper() in content for word in ["FLOOR", "ROOM", "CAPACITY", "OCCUPANCY"]):
             is_priority = True
-        elif fee_match and "FEES_" in source_name:
+        elif fee_match and ("FEES_" in source_name or "MESS" in content):
             is_priority = True
             
         if is_priority:
@@ -53,6 +56,7 @@ def pdf_search(query):
         else:
             other_docs.append(d)
     
+    # Combine prioritized results first, taking the top 8 for context
     final_docs = (prioritized_docs + other_docs)[:8]
     context_list = []
     for d in final_docs:
@@ -60,6 +64,7 @@ def pdf_search(query):
         context_list.append(f"[OFFICIAL SOURCE: {source}]\n{d.page_content}")
     
     return "\n\n---\n\n".join(context_list)
+
 
 def sql_query(query):
     """Runs a query against the SQL database."""
@@ -98,7 +103,6 @@ ROUTING PRIORITY (CRITICAL):
 - CRITICAL: Hostel "Block C" structure is ONLY in the PDF. NEVER use SQL for hostels.
 
 SQL RULES (STRICT SCHEMA MAPPING):
-
 INDEPENDENT COLUMN SELECTION: For every new query, evaluate exactly which columns the user wants. DO NOT carry over columns from previous questions. 
 1. MANDATORY LIKE: For ALL string filters (department, branch, name, designation), you MUST use `LIKE '%keyword%'` instead of `=`. 
 2. KEYWORD ISOLATION: When the user says 'Electrical dept' or 'Computer branch', use ONLY the core noun (e.g., '%Electrical%' or '%Computer%') for the LIKE pattern. Ignore words like 'dept', 'department', 'branch', 'course', 'office'.
@@ -133,10 +137,17 @@ DEMO QUESTION TEMPLATES:
 - Cutoff Comparison: SELECT year, category, percentile FROM cutoffs WHERE branch = 'Computer Engineering' AND category = 'GOPENS' AND (year=2024 OR year=2025);
 - B.Tech Intake: SELECT intake FROM programs WHERE program_name = 'B.Tech Computer Engineering';
 
-PDF RULES (STRICT GROUNDING):
-- You MUST answer ONLY based on the provided TOOL OUTPUT.
-- DO NOT GUESS NUMBERS. If data is missing from the output, say 'I don't have that info'.
-- When answering from a PDF, YOU MUST CITE the filename from the [OFFICIAL SOURCE] tag.
+PDF RULES (STRICT BLOCK ISOLATION):
+1. BLOCK VERIFICATION: When asked about a specific hostel (e.g., Block C), you MUST ONLY use data that is explicitly listed under that block's heading in the provided text.
+2. DO NOT MIX BLOCKS: Never attribute features of one block (e.g., Block D's floors) to another (Block C).
+3. GROUNDING: If the requested block's specific details are not in the tool output, say 'I don't have that info'.
+4. CITE: Always cite the [OFFICIAL SOURCE].
+
+DOCUMENT LOGIC MAPPING (HOSTEL):
+- BLOCK C: Target: First-year B.Tech/Diploma only. Structure: Ground floor (16 rooms + Mess), 1st floor (32 rooms), 2nd floor (32 rooms). Occupancy: 4 students per room.
+- BLOCK D: Intermediate & Senior boys. 4 floors. Majority 3-seater.
+- PG-HOSTEL: Final year & PG. 6 floors. Floors 1-5 (36-40 rooms each). 2 students per room.
+- BLOCKS A & B: Girls. 2 floors. 3 girls per room.
 
 FEE POLICY (CRITICAL):
 - For any questions regarding tuition fees, development fees, or total annual amounts, DO NOT state any numerical figures or currency amounts.
@@ -174,7 +185,8 @@ TO USE A TOOL, respond ONLY with this JSON format:
                         if tool_name in ["Campus_SQL_Data", "SQL"]:
                             final_task_note = "CRITICAL: Ensure your Markdown table includes the 'category' column. If it is missing from the data, explain why."
                         else:
-                            final_task_note = "REMINDER: For fee queries, do not state numbers. Provide the official filename for cross-verification."
+                            # Refined task note to enforce Block-Specific Accuracy and room count differentiation
+                            final_task_note = "STRICT BLOCK ISOLATION & NUMERICAL ACCURACY: Carefully identify the room count for EACH floor (Ground, 1st, 2nd) mentioned in the text. Do not confuse 'students per room' with 'total rooms'. If the text says '32 rooms each' for floors, report that exactly."
 
                         messages.append(AIMessage(content=content))
                         messages.append(HumanMessage(content=f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: Based ONLY on this data, answer: '{user_input}'. {final_task_note}"))
@@ -182,18 +194,16 @@ TO USE A TOOL, respond ONLY with this JSON format:
                         final_response = llm.invoke(messages)
                         bot_text = final_response.content
                         
-                        # --- PDF ATTACHMENT LOGIC ---
                         source_match = re.search(r'([A-Za-z0-9_-]+\.pdf)', bot_text)
                         attachment_msg = ""
                         if source_match:
                             filename = source_match.group(1)
-                            full_path = os.path.join(DOCS_FOLDER, filename)
-                            attachment_msg = f"\n\n📎 [Attachment Found: {filename}]\n> Location: {full_path}\n> (You can verify this document in your campus_documents folder)"
+                            attachment_msg = f"\n\n📎 [Attachment Found: {filename}]"
                         
                         print(f"\nBot: {bot_text}{attachment_msg}")
                         messages.append(final_response)
                     else:
-                        print(f"\nBot: [Internal Error] Invalid tool: {tool_name}")
+                        print(f"\nBot: [Internal Error] Invalid tool selected.")
                 except Exception as e:
                     print(f"\nBot: {content}")
             else:
