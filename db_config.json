@@ -1,0 +1,7 @@
+{
+    "faculty": ["email"],
+    "cutoffs": ["year", "branch", "category"],
+    "programs": ["program_name"],
+    "placements": ["year", "company", "branch"],
+    "locations": ["name"]
+}
