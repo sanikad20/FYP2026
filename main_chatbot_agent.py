@@ -22,7 +22,7 @@ vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embedding
 def pdf_search(query):
     """Retrieves text from PDFs with an enhanced re-ranker for structural data."""
     print(f"   🔍 Searching PDF Database for: '{query}'...")
-    # k=15 gives a wide net for similarity before we re-rank
+    # Increase k to ensure we catch all potential calendar/event chunks
     raw_docs = vector_db.similarity_search(query, k=15)
     
     # --- DEBUG: SHOW RETRIEVED SOURCES ---
@@ -30,25 +30,33 @@ def pdf_search(query):
     print(f"   📂 Retrieved Chunks from: {retrieved_sources}")
     
     # --- ENHANCED KEYWORD RE-RANKER ---
-    # We look for terms that indicate structural hostel data or target groups
-    target_match = re.search(r'(Target|Group|B.Tech|Diploma|First Year|FY|Exclusively)', query, re.IGNORECASE)
-    structure_match = re.search(r'(Floor|Structure|Room|Capacity|Occupancy|Seater|Ground)', query, re.IGNORECASE)
-    fee_match = re.search(r'(Fee|Tuition|Mess|Payment|SBI|Contractor)', query, re.IGNORECASE)
+    # Expanded keyword lists for better intent detection
+    target_k = ["TARGET", "B.TECH", "DIPLOMA", "FIRST YEAR", "FY", "EXCLUSIVELY", "SENIOR", "SY", "PG"]
+    structure_k = ["FLOOR", "STRUCTURE", "ROOM", "CAPACITY", "OCCUPANCY", "SEATER", "GROUND"]
+    fee_k = ["FEE", "TUITION", "MESS", "PAYMENT", "SBI", "CONTRACTOR", "REFUND", "TFWS"]
+    cal_k = ["CALENDAR", "SCHEDULE", "DATE", "SEMESTER", "EXAM", "ESE", "MST", "CLASSES", "START", "END", "REGISTER", "REGISTRATION", "PORTAL", "WEBSITE", "FEST", "TECHNOVANZA", "PRATIBIMB", "HOLIDAY", "BREAK"]
     
     prioritized_docs = []
     other_docs = []
+    
+    q_upper = query.upper()
     
     for d in raw_docs:
         content = d.page_content.upper()
         source_name = os.path.basename(d.metadata.get('source', '')).upper()
         
         is_priority = False
-        # Check for matching structural or target group keywords in the chunk content
-        if target_match and any(word.upper() in content for word in ["TARGET", "B.TECH", "DIPLOMA", "EXCLUSIVELY"]):
+        # 1. Target Group Check
+        if any(k in q_upper for k in target_k) and any(k in content for k in target_k):
             is_priority = True
-        elif structure_match and any(word.upper() in content for word in ["FLOOR", "ROOM", "CAPACITY", "OCCUPANCY"]):
+        # 2. Building Structure Check
+        elif any(k in q_upper for k in structure_k) and any(k in content for k in structure_k):
             is_priority = True
-        elif fee_match and ("FEES_" in source_name or "MESS" in content):
+        # 3. Calendar & Fest Check (Most critical for current hallucinations)
+        elif any(k in q_upper for k in cal_k) and ("CALENDAR" in source_name or any(k in content for k in cal_k)):
+            is_priority = True
+        # 4. Fee Check
+        elif any(k in q_upper for k in fee_k) and ("FEES_" in source_name or "REFUND" in source_name or any(k in content for k in fee_k)):
             is_priority = True
             
         if is_priority:
@@ -56,8 +64,8 @@ def pdf_search(query):
         else:
             other_docs.append(d)
     
-    # Combine prioritized results first, taking the top 8 for context
-    final_docs = (prioritized_docs + other_docs)[:8]
+    # Take the top 10 prioritized chunks to give the LLM enough context to find the dates
+    final_docs = (prioritized_docs + other_docs)[:10]
     context_list = []
     for d in final_docs:
         source = os.path.basename(d.metadata.get('source', 'Unknown File'))
@@ -70,7 +78,6 @@ def sql_query(query):
     """Runs a query against the SQL database."""
     print(f"   🗄️  Running SQL Query: {query}...")
     try:
-        # Clean potential markdown or extra words from the AI
         clean_query = query.replace("```sql", "").replace("```", "").strip()
         result = db.run(clean_query)
         return str(result) if result else "No matching records found in SQL."
@@ -91,16 +98,15 @@ tools_map = {
 def chat():
     print("\n" + "="*50)
     print(f"🤖 VJTI Bot (Local {MODEL_NAME}) is Online!")
-    print("Strict Category Mapping & Mandatory Display logic Active.")
-    print("Type 'exit' to quit.")
+    print("Anti-Hallucination Guardrails & Sliding Window Memory: Active.")
     print("="*50)
     
     system_instruction = """You are the VJTI Smart Campus Assistant.
 
 ROUTING PRIORITY (CRITICAL):
 - Use 'Campus_SQL_Data' (or simply 'SQL') for: Lists of programs, intake numbers, faculty locations, HOD names, and cutoffs.
-- Use 'PDF_Knowledge_Base' (or simply 'PDF') for: Hostel structure, room counts, fees, and policies.
-- CRITICAL: Hostel "Block C" structure is ONLY in the PDF. NEVER use SQL for hostels.
+- Use 'PDF_Knowledge_Base' (or simply 'PDF') for: Hostel structure, room counts, fees, policies, academic calendars, and important dates/schedules.
+- CRITICAL: Hostel "Block C" structure, Dates for exams (MST/ESE), class start dates, and holiday schedules is ONLY in the PDF. NEVER use SQL for hostels.
 
 SQL RULES (STRICT SCHEMA MAPPING):
 INDEPENDENT COLUMN SELECTION: For every new query, evaluate exactly which columns the user wants. DO NOT carry over columns from previous questions. 
@@ -132,6 +138,10 @@ INDEPENDENT COLUMN SELECTION: For every new query, evaluate exactly which column
     - ALWAYS use `LIKE '%HOD%'` for any query related to "HOD", "Head", or "Head of Department". NEVER use long-form strings.
     - HOD Search Example: WHERE designation LIKE '%HOD%' AND department LIKE '%Computer%'.
 
+7. ELIGIBILITY & PERCENTILE LOGIC (NEW):
+- When a user provides a percentile and asks "what can I get" or "what did I clear", you MUST query the 'cutoffs' table, NOT the 'programs' table.
+- The 'cutoffs' table DOES have a 'branch' column. Example query: SELECT branch, percentile FROM cutoffs WHERE percentile <= 90.3 AND category LIKE '%EWS%' AND year = 2025;
+
 DEMO QUESTION TEMPLATES:
 - M.Tech Intakes: SELECT program_name, intake FROM programs WHERE level = 'Postgraduate' AND program_name LIKE 'M.Tech%';
 - Cutoff Comparison: SELECT year, category, percentile FROM cutoffs WHERE branch = 'Computer Engineering' AND category = 'GOPENS' AND (year=2024 OR year=2025);
@@ -148,6 +158,9 @@ DOCUMENT LOGIC MAPPING (HOSTEL):
 - BLOCK D: Intermediate & Senior boys. 4 floors. Majority 3-seater.
 - PG-HOSTEL: Final year & PG. 6 floors. Floors 1-5 (36-40 rooms each). 2 students per room.
 - BLOCKS A & B: Girls. 2 floors. 3 girls per room.
+- ACADEMIC CALENDAR: Distinguish between "First Year (FY)" and "Senior Year (SY onwards)". Senior Year classes usually start in July; First Year classes usually start in September. Always check the specific semester (Odd/Even) and student level before answering.
+- ERP PORTAL: For questions about "where to register" or "registration site", identify the Official VJTI ERP Portal URL: https://erp.vjti.ac.in/.
+- MAJOR EVENTS: Technovanza is held in December/January. Pratibimb is held in February.
 
 FEE POLICY (CRITICAL):
 - For any questions regarding tuition fees, development fees, or total annual amounts, DO NOT state any numerical figures or currency amounts.
@@ -157,7 +170,8 @@ FEE POLICY (CRITICAL):
 TO USE A TOOL, respond ONLY with this JSON format:
 {"tool": "Campus_SQL_Data", "query": "SELECT ..."}
 """
-    messages = [SystemMessage(content=system_instruction)]
+    system_message = SystemMessage(content=system_instruction)
+    chat_history = [] 
 
     while True:
         try:
@@ -165,9 +179,12 @@ TO USE A TOOL, respond ONLY with this JSON format:
             if user_input.lower() in ["exit", "quit", "bye"]: break
             if not user_input.strip(): continue
                 
-            messages.append(HumanMessage(content=user_input))
+            chat_history.append(HumanMessage(content=user_input))
             
-            response = llm.invoke(messages)
+            # Use a sliding window of the last 6 messages to prevent context drift
+            messages_to_send = [system_message] + chat_history[-6:]
+            
+            response = llm.invoke(messages_to_send)
             content = response.content.strip()
             
             json_match = re.search(r'\{.*"tool":\s*"(.*?)",\s*"query":\s*"(.*?)"\s*\}', content, re.DOTALL)
@@ -183,32 +200,45 @@ TO USE A TOOL, respond ONLY with this JSON format:
                         result = tools_map[tool_name](query_arg)
                         
                         if tool_name in ["Campus_SQL_Data", "SQL"]:
-                            final_task_note = "CRITICAL: Ensure your Markdown table includes the 'category' column. If it is missing from the data, explain why."
+                            final_task_note = "CRITICAL: Ensure your table includes 'branch' and 'category'. Do not guess data."
                         else:
-                            # Refined task note to enforce Block-Specific Accuracy and room count differentiation
-                            final_task_note = "STRICT BLOCK ISOLATION & NUMERICAL ACCURACY: Carefully identify the room count for EACH floor (Ground, 1st, 2nd) mentioned in the text. Do not confuse 'students per room' with 'total rooms'. If the text says '32 rooms each' for floors, report that exactly."
+                            # Context-Sensitive Task Note Selection
+                            u_q_l = user_input.lower()
+                            if any(k in u_q_l for k in ["hostel", "block", "room", "stay"]):
+                                final_task_note = "STRICT NUMERICAL ACCURACY: Identify specific room counts for EACH floor from the text. Cite the source."
+                            elif "technovanza" in u_q_l or "pratibimb" in u_q_l:
+                                # Strongest possible override for fest hallucinations
+                                final_task_note = "ABSOLUTE GROUNDING: Only report Technovanza as Dec/Jan and Pratibimb as Feb IF found in the text. If the text says otherwise, follow the text. If not in text, say you don't know. DO NOT use external knowledge."
+                            elif any(k in u_q_l for k in ["calendar", "date", "semester", "register", "portal"]):
+                                final_task_note = "STRICT DATE ACCURACY: Only report dates explicitly found in the TOOL OUTPUT. If Even Semester registration dates aren't there, say you don't have that info. Cite the source and URL (https://erp.vjti.ac.in/)."
+                            else:
+                                final_task_note = "STRICT GROUNDING: Answer based solely on the tool output."
 
-                        messages.append(AIMessage(content=content))
-                        messages.append(HumanMessage(content=f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: Based ONLY on this data, answer: '{user_input}'. {final_task_note}"))
+                        chat_history.append(AIMessage(content=content))
+                        tool_output_msg = HumanMessage(content=f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: Based ONLY on this data, answer: '{user_input}'. {final_task_note}")
+                        chat_history.append(tool_output_msg)
                         
-                        final_response = llm.invoke(messages)
+                        final_response = llm.invoke([system_message] + chat_history[-6:])
                         bot_text = final_response.content
                         
                         source_match = re.search(r'([A-Za-z0-9_-]+\.pdf)', bot_text)
                         attachment_msg = ""
                         if source_match:
                             filename = source_match.group(1)
-                            attachment_msg = f"\n\n📎 [Attachment Found: {filename}]"
+                            full_path = os.path.join(DOCS_FOLDER, filename)
+                            attachment_msg = f"\n\n📎 [Attachment Found: {filename}]\n> Location: {full_path}"
                         
                         print(f"\nBot: {bot_text}{attachment_msg}")
-                        messages.append(final_response)
+                        chat_history.append(final_response)
                     else:
                         print(f"\nBot: [Internal Error] Invalid tool selected.")
                 except Exception as e:
                     print(f"\nBot: {content}")
             else:
                 print(f"\nBot: {content}")
-                messages.append(response)
+                chat_history.append(response)
+
+            if len(chat_history) > 20: chat_history = chat_history[-10:]
 
         except Exception as e:
             print(f"\nBot: Error: {str(e)}")
