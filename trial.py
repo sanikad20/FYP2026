@@ -3,6 +3,7 @@ import sqlite3
 import json
 import re
 import webbrowser
+import tiktoken
 from langchain_community.chat_models import ChatOllama
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -12,46 +13,88 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 # 1. CONFIGURATION
 MODEL_NAME = "llama3" 
 DOCS_FOLDER = "./campus_documents"
+MAX_TOKENS = 7000  # Leave 1000 tokens for response generation
+TOKEN_BUFFER = 1000  # Safety buffer
 
 # 2. CONNECT TO DATABASES
 db = SQLDatabase.from_uri("sqlite:///campus.db")
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 vector_db = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
 
-# 3. DEFINE THE TOOLS
+# 3. TOKEN COUNTER FUNCTION
+def count_tokens(text, model="llama3"):
+    """Count tokens in text - using tiktoken as approximation for Llama"""
+    try:
+        enc = tiktoken.get_encoding("cl100k_base")  # Good approximation for many models
+        return len(enc.encode(text))
+    except:
+        # Fallback: rough estimate (4 chars per token)
+        return len(text) // 4
+
+def count_messages_tokens(messages):
+    """Count total tokens in a list of messages"""
+    total = 0
+    for msg in messages:
+        total += count_tokens(msg.content)
+    return total
+
+def trim_chat_history(system_msg, chat_history, max_tokens=MAX_TOKENS):
+    """Trim chat history based on token count, keeping most recent messages"""
+    messages = [system_msg] + chat_history
+    total_tokens = count_messages_tokens(messages)
+    
+    # If within limits, return original history
+    if total_tokens <= max_tokens:
+        return chat_history
+    
+    # Remove oldest messages until under limit
+    trimmed_history = chat_history.copy()
+    while total_tokens > max_tokens and len(trimmed_history) > 2:  # Keep at least 2 most recent
+        removed = trimmed_history.pop(0)
+        total_tokens -= count_tokens(removed.content)
+        # Also remove the corresponding message pair if it was a tool output
+        if len(trimmed_history) > 0 and isinstance(removed, HumanMessage) and "TOOL OUTPUT:" in removed.content:
+            # This was a tool output message, we already removed it
+            pass
+    
+    print(f"   📊 Trimmed history from {len(chat_history)} to {len(trimmed_history)} messages ({total_tokens}/{max_tokens} tokens)")
+    return trimmed_history
+
+# 4. DEFINE THE TOOLS (OPTIMIZED FOR TOKEN USAGE)
 def pdf_search(query):
-    """Retrieves text from PDFs with an enhanced re-ranker for structural data."""
+    """Retrieves text from PDFs with enhanced re-ranker and token optimization."""
     print(f"   🔍 Searching PDF Database for: '{query}'...")
-    # k=15 gives a wide net for similarity before we re-rank
-    raw_docs = vector_db.similarity_search(query, k=15)
+    
+    # REDUCED: k=8 instead of 15 to save tokens
+    raw_docs = vector_db.similarity_search(query, k=8)
     
     # --- DEBUG: SHOW RETRIEVED SOURCES ---
     retrieved_sources = list(set([os.path.basename(d.metadata.get('source', 'Unknown')) for d in raw_docs]))
     print(f"   📂 Retrieved Chunks from: {retrieved_sources}")
     
     # --- ENHANCED KEYWORD RE-RANKER ---
-    # Detect intent keywords for prioritization
-    target_match = re.search(r'(Target|Group|B.Tech|Diploma|First Year|FY|Exclusively|Senior)', query, re.IGNORECASE)
-    structure_match = re.search(r'(Floor|Structure|Room|Capacity|Occupancy|Seater|Ground)', query, re.IGNORECASE)
-    fee_match = re.search(r'(Fee|Tuition|Mess|Payment|SBI|Contractor)', query, re.IGNORECASE)
-    # Added 'Register' and 'Portal' to ensure registration links are prioritized
-    calendar_match = re.search(r'(Calendar|Schedule|Date|Semester|Exam|ESE|MST|Classes|Start|End|Register|Portal|Website)', query, re.IGNORECASE)
+    target_k = ["TARGET", "B.TECH", "DIPLOMA", "FIRST YEAR", "FY", "EXCLUSIVELY", "SENIOR", "SY", "PG"]
+    structure_k = ["FLOOR", "STRUCTURE", "ROOM", "CAPACITY", "OCCUPANCY", "SEATER", "GROUND"]
+    fee_k = ["FEE", "TUITION", "MESS", "PAYMENT", "SBI", "CONTRACTOR", "REFUND", "TFWS"]
+    cal_k = ["CALENDAR", "SCHEDULE", "DATE", "SEMESTER", "EXAM", "ESE", "MST", "CLASSES", "START", "END", "REGISTER", "REGISTRATION", "PORTAL", "WEBSITE", "FEST", "TECHNOVANZA", "PRATIBIMB", "HOLIDAY", "BREAK"]
     
     prioritized_docs = []
     other_docs = []
+    
+    q_upper = query.upper()
     
     for d in raw_docs:
         content = d.page_content.upper()
         source_name = os.path.basename(d.metadata.get('source', '')).upper()
         
         is_priority = False
-        if target_match and any(word.upper() in content for word in ["TARGET", "B.TECH", "DIPLOMA", "EXCLUSIVELY"]):
+        if any(k in q_upper for k in target_k) and any(k in content for k in target_k):
             is_priority = True
-        elif structure_match and any(word.upper() in content for word in ["FLOOR", "ROOM", "CAPACITY", "OCCUPANCY"]):
+        elif any(k in q_upper for k in structure_k) and any(k in content for k in structure_k):
             is_priority = True
-        elif calendar_match and ("CALENDAR" in source_name or "DATE" in content or "CLASSES" in content or "SEMESTER" in content or "REGISTER" in content or "PORTAL" in content):
+        elif any(k in q_upper for k in cal_k) and ("CALENDAR" in source_name or any(k in content for k in cal_k)):
             is_priority = True
-        elif fee_match and ("FEES_" in source_name or "MESS" in content):
+        elif any(k in q_upper for k in fee_k) and ("FEES_" in source_name or "REFUND" in source_name or any(k in content for k in fee_k)):
             is_priority = True
             
         if is_priority:
@@ -59,28 +102,47 @@ def pdf_search(query):
         else:
             other_docs.append(d)
     
-    # Combine prioritized results first, taking the top 8 for context
-    final_docs = (prioritized_docs + other_docs)[:8]
+    # REDUCED: Take top 5 prioritized chunks instead of 10
+    final_docs = (prioritized_docs + other_docs)[:5]
+    
+    # TRUNCATE: Limit each chunk to ~200 words to save tokens
     context_list = []
     for d in final_docs:
         source = os.path.basename(d.metadata.get('source', 'Unknown File'))
-        context_list.append(f"[OFFICIAL SOURCE: {source}]\n{d.page_content}")
+        
+        # Truncate long chunks
+        content = d.page_content
+        words = content.split()
+        if len(words) > 250:  # ~250 words = ~300-350 tokens
+            content = ' '.join(words[:250]) + '... [truncated]'
+        
+        context_list.append(f"[OFFICIAL SOURCE: {source}]\n{content}")
     
     return "\n\n---\n\n".join(context_list)
 
 
 def sql_query(query):
-    """Runs a query against the SQL database."""
+    """Runs a query against the SQL database with result truncation."""
     print(f"   🗄️  Running SQL Query: {query}...")
     try:
-        # Clean potential markdown or extra words from the AI
         clean_query = query.replace("```sql", "").replace("```", "").strip()
         result = db.run(clean_query)
+        
+        # Truncate large results
+        if result and len(str(result)) > 1000:
+            result_str = str(result)
+            # Try to parse as list/dict and truncate
+            if result_str.startswith('[') or result_str.startswith('{'):
+                truncated = result_str[:800] + f'... [truncated: total length {len(result_str)} chars]'
+                return truncated
+            else:
+                return result_str[:800] + '... [truncated]'
+        
         return str(result) if result else "No matching records found in SQL."
     except Exception as e:
         return f"SQL Error: {str(e)}"
 
-# 4. INITIALIZE OLLAMA
+# 5. INITIALIZE OLLAMA
 llm = ChatOllama(model=MODEL_NAME, temperature=0)
 
 tools_map = {
@@ -90,19 +152,12 @@ tools_map = {
     "PDF": pdf_search
 }
 
-# 5. THE CHAT LOOP
-def chat():
-    print("\n" + "="*50)
-    print(f"🤖 VJTI Bot (Local {MODEL_NAME}) is Online!")
-    print("Memory Protection Logic: Active.")
-    print("Type 'exit' to quit.")
-    print("="*50)
-    
-    system_instruction = """You are the VJTI Smart Campus Assistant.
+# 6. SYSTEM PROMPT (OPTIMIZED - removed redundant examples to save tokens)
+system_instruction = """You are the VJTI Smart Campus Assistant.
 
 ROUTING PRIORITY (CRITICAL):
 - Use 'Campus_SQL_Data' (or simply 'SQL') for: Lists of programs, intake numbers, faculty locations, HOD names, and cutoffs.
-- Use 'PDF_Knowledge_Base' (or simply 'PDF') for: Hostel structure, room counts, fees, policies, academic calendars, and important dates/schedules.
+- Use 'PDF_Knowledge_Base' (or simply 'PDF') for: Hostel structure, room counts, fees, policies, academic calendars, important dates/schedules, Hostel details, Fees, Admission Stages (CAP), Seat Acceptance (Freeze/Float/Betterment), Anti-Ragging procedures, and Attendance Rules..
 - CRITICAL: Hostel "Block C" structure, Dates for exams (MST/ESE), class start dates, and holiday schedules is ONLY in the PDF. NEVER use SQL for hostels.
 
 SQL RULES (STRICT SCHEMA MAPPING):
@@ -157,6 +212,8 @@ DOCUMENT LOGIC MAPPING (HOSTEL):
 - BLOCKS A & B: Girls. 2 floors. 3 girls per room.
 - ACADEMIC CALENDAR: Distinguish between "First Year (FY)" and "Senior Year (SY onwards)". Senior Year classes usually start in July; First Year classes usually start in September. Always check the specific semester (Odd/Even) and student level before answering.
 - ERP PORTAL: For questions about "where to register" or "registration site", identify the Official VJTI ERP Portal URL: https://erp.vjti.ac.in/.
+- MAJOR EVENTS: Technovanza is held in December/January. Pratibimb is held in February.
+- ANTI-RAGGING: Step 1: Informal (Warden/Faculty). Step 2: Formal Written (Box/Dr. Gangopadhyay). Step 3: Online (UGC portal). Step 4: Committee Enquiry.
 
 FEE POLICY (CRITICAL):
 - For any questions regarding tuition fees, development fees, or total annual amounts, DO NOT state any numerical figures or currency amounts.
@@ -166,21 +223,46 @@ FEE POLICY (CRITICAL):
 TO USE A TOOL, respond ONLY with this JSON format:
 {"tool": "Campus_SQL_Data", "query": "SELECT ..."}
 """
-    # Initialize separate system message and chat history
-    system_message = SystemMessage(content=system_instruction)
-    chat_history = [] 
 
+# 7. THE CHAT LOOP
+def chat():
+    print("\n" + "="*50)
+    print(f"🤖 VJTI Bot (Local {MODEL_NAME}) is Online!")
+    print(f"Token Management: Active (Max {MAX_TOKENS} tokens)")
+    print("Commands: !reset - Clear memory, !stats - Show token usage")
+    print("="*50)
+    
+    system_message = SystemMessage(content=system_instruction)
+    chat_history = []
+    
     while True:
         try:
             user_input = input("\nYou: ")
-            if user_input.lower() in ["exit", "quit", "bye"]: break
-            if not user_input.strip(): continue
-                
+            if user_input.lower() in ["exit", "quit", "bye"]: 
+                break
+            if user_input.lower() == "!reset":
+                chat_history = []
+                print("Bot: Memory cleared.")
+                continue
+            if user_input.lower() == "!stats":
+                total = count_messages_tokens([system_message] + chat_history)
+                print(f"📊 Current token usage: {total}/{MAX_TOKENS} (System + History)")
+                print(f"   Messages in history: {len(chat_history)}")
+                continue
+            if not user_input.strip(): 
+                continue
+            
             chat_history.append(HumanMessage(content=user_input))
             
-            # SLIDING WINDOW: Combine System Instructions with ONLY the last 6 messages
-            # This prevents the bot from fumbling early questions after a long session
-            messages_to_send = [system_message] + chat_history[-6:]
+            # Trim history based on tokens BEFORE sending
+            chat_history = trim_chat_history(system_message, chat_history)
+            
+            # Prepare messages for LLM
+            messages_to_send = [system_message] + chat_history[-6:]  # Keep last 6 messages after trimming
+            
+            # Debug token count
+            token_count = count_messages_tokens(messages_to_send)
+            print(f"   📊 Sending {token_count} tokens to LLM")
             
             response = llm.invoke(messages_to_send)
             content = response.content.strip()
@@ -197,53 +279,70 @@ TO USE A TOOL, respond ONLY with this JSON format:
                         print(f"⚙️  Executing {tool_name}...")
                         result = tools_map[tool_name](query_arg)
                         
-                        if tool_name in ["Campus_SQL_Data", "SQL"]:
-                            final_task_note = "CRITICAL: Ensure your Markdown table includes the 'category' column. Note that 'branch' is a valid column in the 'cutoffs' table."
+                        # Context-sensitive task note (shortened to save tokens)
+                        u_q_l = user_input.lower()
+                        if any(k in u_q_l for k in ["hostel", "block", "room", "stay"]):
+                            final_task_note = "Use ONLY room counts from text. Cite source."
+                        elif "technovanza" in u_q_l or "pratibimb" in u_q_l:
+                            final_task_note = "Only use dates from text. If not there, say unknown."
+                        elif any(k in u_q_l for k in ["calendar", "date", "semester", "register", "portal"]):
+                            final_task_note = f"Use ONLY dates from output. Cite source & https://erp.vjti.ac.in/"
                         else:
-                            # Context-Sensitive Task Note Selection
-                            user_q_lower = user_input.lower()
-                            if any(k in user_q_lower for k in ["hostel", "block", "room", "stay", "accommodation"]):
-                                final_task_note = "STRICT BLOCK ISOLATION & NUMERICAL ACCURACY: Carefully identify the room count for EACH floor (Ground, 1st, 2nd) mentioned in the text for the requested block. Do not confuse 'students per room' with 'total rooms'."
-                            elif any(k in user_q_lower for k in ["calendar", "date", "semester", "schedule", "start", "end", "mst", "ese", "register", "registration", "portal", "site", "website", "link"]):
-                                final_task_note = "STRICT ACCURACY: Identify specific dates or URLs for the requested query. If asking about registration, you MUST look for and report the 'ERP Portal' link (https://erp.vjti.ac.in/) found in the text. Cite the [OFFICIAL SOURCE]."
-                            elif any(k in user_q_lower for k in ["fee", "tuition", "pay", "charge"]):
-                                final_task_note = "REMINDER: For fee queries, do not state numbers. Provide the official filename for cross-verification."
-                            else:
-                                final_task_note = "STRICT GROUNDING: Answer based solely on the provided tool output. If the answer is not in the text, say you don't have that info."
+                            final_task_note = "Answer based ONLY on tool output."
 
+                        # Store the tool call
                         chat_history.append(AIMessage(content=content))
                         
-                        # Add tool output to history for the next turn
-                        tool_output_msg = HumanMessage(content=f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: Based ONLY on this data, answer: '{user_input}'. {final_task_note}")
+                        # Create tool output message (truncated if too long)
+                        tool_output = f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: {final_task_note}"
+                        if count_tokens(tool_output) > 1500:
+                            # Aggressively truncate if still too long
+                            tool_output = f"TOOL OUTPUT:\n{result[:1000]}...\n\nFINAL TASK: {final_task_note}"
+                        
+                        tool_output_msg = HumanMessage(content=tool_output)
                         chat_history.append(tool_output_msg)
                         
-                        # Get final answer with the updated window
-                        final_response = llm.invoke([system_message] + chat_history[-6:])
+                        # Trim again before final response
+                        chat_history = trim_chat_history(system_message, chat_history)
+                        
+                        # Get final response
+                        final_response = llm.invoke([system_message] + chat_history[-4:])  # Use fewer messages for final
                         bot_text = final_response.content
                         
+                        # Extract source for attachment
                         source_match = re.search(r'([A-Za-z0-9_-]+\.pdf)', bot_text)
                         attachment_msg = ""
                         if source_match:
                             filename = source_match.group(1)
                             full_path = os.path.join(DOCS_FOLDER, filename)
-                            attachment_msg = f"\n\n📎 [Attachment Found: {filename}]\n> Location: {full_path}\n> (You can verify this document in your campus_documents folder)"
+                            if os.path.exists(full_path):
+                                attachment_msg = f"\n\n📎 [Attachment: {filename}]"
                         
                         print(f"\nBot: {bot_text}{attachment_msg}")
                         chat_history.append(final_response)
                     else:
-                        print(f"\nBot: [Internal Error] Invalid tool selected.")
+                        print(f"\nBot: [Error] Invalid tool: {tool_name}")
                 except Exception as e:
-                    print(f"\nBot: {content}")
+                    print(f"\nBot: Error processing tool: {str(e)}")
+                    print(f"Raw response: {content}")
             else:
                 print(f"\nBot: {content}")
                 chat_history.append(response)
-
-            # Prune chat history to prevent memory leaks in extreme cases
+            
+            # Final safety trim - keep history under control
             if len(chat_history) > 20:
-                chat_history = chat_history[-10:]
+                # Keep more recent messages but ensure token count is managed
+                chat_history = chat_history[-15:]
+                # Force a token-based trim
+                chat_history = trim_chat_history(system_message, chat_history, MAX_TOKENS - TOKEN_BUFFER)
 
+        except KeyboardInterrupt:
+            print("\nBot: Goodbye!")
+            break
         except Exception as e:
-            print(f"\nBot: Error: {str(e)}")
+            print(f"\nBot: Unexpected error: {str(e)}")
+            # Don't break the loop on error
+            continue
 
 if __name__ == "__main__":
     chat()
