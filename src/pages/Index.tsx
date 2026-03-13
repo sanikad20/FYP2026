@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { Bot, Moon, Sun } from "lucide-react";
+import { Bot, Moon, Sun, AlertCircle } from "lucide-react";
 import { useTheme } from "@/components/ThemeProvider";
 import { Button } from "@/components/ui/button";
 import MessageBubble from "@/components/chat/MessageBubble";
@@ -11,17 +11,21 @@ import PlacementChart from "@/components/chat/PlacementChart";
 import ChatInput from "@/components/chat/ChatInput";
 import { AppSidebar } from "@/components/AppSidebar";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { sendMessage, checkHealth } from "@/lib/chatApi";
+import { toast } from "sonner";
 
 interface Message {
   id: string;
   type: "text" | "quick-reply" | "map" | "faculty" | "placements";
   content?: string;
   isUser: boolean;
+  sourceFile?: string;
 }
 
 const Index = () => {
   const { theme, setTheme } = useTheme();
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
   const [messages, setMessages] = useState<Message[]>([
     {
       id: "1",
@@ -37,39 +41,44 @@ const Index = () => {
   ]);
   const [isTyping, setIsTyping] = useState(false);
 
+  // Check backend health on mount
+  useEffect(() => {
+    checkHealth().then(setBackendOnline);
+  }, []);
+
   // Auto-scroll to bottom when messages change
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isTyping]);
 
   const handleQuickReply = (action: string) => {
-    // Add user message
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: Date.now().toString(),
-        type: "text",
-        content: `Show me ${action === "map" ? "campus map" : action === "faculty" ? "faculty list" : "placement statistics"}`,
-        isUser: true,
-      },
-    ]);
-
-    // Simulate bot typing
-    setIsTyping(true);
-    setTimeout(() => {
-      setIsTyping(false);
+    if (action === "map" || action === "faculty" || action === "placements") {
       setMessages((prev) => [
         ...prev,
         {
-          id: (Date.now() + 1).toString(),
-          type: action as "map" | "faculty" | "placements",
-          isUser: false,
+          id: Date.now().toString(),
+          type: "text",
+          content: `Show me ${action === "map" ? "campus map" : action === "faculty" ? "faculty list" : "placement statistics"}`,
+          isUser: true,
         },
       ]);
-    }, 1500);
+      setIsTyping(true);
+      setTimeout(() => {
+        setIsTyping(false);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: (Date.now() + 1).toString(),
+            type: action as "map" | "faculty" | "placements",
+            isUser: false,
+          },
+        ]);
+      }, 500);
+      return;
+    }
   };
 
-  const handleSendMessage = (content: string) => {
+  const handleSendMessage = async (content: string) => {
     setMessages((prev) => [
       ...prev,
       {
@@ -80,20 +89,34 @@ const Index = () => {
       },
     ]);
 
-    // Simulate bot response
     setIsTyping(true);
-    setTimeout(() => {
+
+    try {
+      const response = await sendMessage(content);
       setIsTyping(false);
       setMessages((prev) => [
         ...prev,
         {
           id: (Date.now() + 1).toString(),
           type: "text",
-          content: "I understand you're looking for information. How can I help you with that?",
+          content: response.reply,
+          isUser: false,
+          sourceFile: response.source_file,
+        },
+      ]);
+    } catch (error) {
+      setIsTyping(false);
+      toast.error("Could not reach the backend. Make sure the Python server is running.");
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: (Date.now() + 1).toString(),
+          type: "text",
+          content: "⚠️ I couldn't connect to the backend server. Please make sure the Python server is running (`python backend_api.py`).",
           isUser: false,
         },
       ]);
-    }, 1500);
+    }
   };
 
   return (
@@ -110,6 +133,12 @@ const Index = () => {
                 <div className="flex items-center gap-2">
                   <Bot className="h-5 w-5 text-primary" />
                   <h1 className="text-lg font-semibold">Smart Campus Assistant</h1>
+                  {backendOnline !== null && (
+                    <span className={`ml-2 inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${backendOnline ? 'bg-green-500/10 text-green-600' : 'bg-destructive/10 text-destructive'}`}>
+                      <span className={`h-1.5 w-1.5 rounded-full ${backendOnline ? 'bg-green-500' : 'bg-destructive'}`} />
+                      {backendOnline ? 'AI Online' : 'AI Offline'}
+                    </span>
+                  )}
                 </div>
               </div>
               <Button
