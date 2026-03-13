@@ -133,6 +133,12 @@ const Index = () => {
                 <div className="flex items-center gap-2">
                   <Bot className="h-5 w-5 text-primary" />
                   <h1 className="text-lg font-semibold">Smart Campus Assistant</h1>
+                  {backendOnline !== null && (
+                    <span className={`ml-2 inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${backendOnline ? 'bg-green-500/10 text-green-600' : 'bg-destructive/10 text-destructive'}`}>
+                      <span className={`h-1.5 w-1.5 rounded-full ${backendOnline ? 'bg-green-500' : 'bg-destructive'}`} />
+                      {backendOnline ? 'AI Online' : 'AI Offline'}
+                    </span>
+                  )}
                 </div>
               </div>
               <Button
