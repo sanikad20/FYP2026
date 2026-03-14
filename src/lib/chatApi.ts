@@ -9,6 +9,9 @@ export function resetSession() {
 export interface ChatResponse {
   reply: string;
   source_file?: string;
+  // PDF serve fields — present when backend returns a document directly
+  serve_pdf?: string;
+  serve_pdf_path?: string;
 }
 
 export async function sendMessage(message: string): Promise<ChatResponse> {

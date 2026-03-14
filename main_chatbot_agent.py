@@ -105,7 +105,7 @@ def chat():
 
 ROUTING PRIORITY (CRITICAL):
 - Use 'Campus_SQL_Data' (or simply 'SQL') for: Lists of programs, intake numbers, faculty locations, HOD names, and cutoffs.
-- Use 'PDF_Knowledge_Base' (or simply 'PDF') for: Hostel structure, room counts, fees, policies, academic calendars, important dates/schedules, Hostel details, Fees, Admission Stages (CAP), Seat Acceptance (Freeze/Float/Betterment), Anti-Ragging procedures, and Attendance Rules..
+- Use 'PDF_Knowledge_Base' (or simply 'PDF') for: Hostel structure, room counts, fees, policies, academic calendars, important dates/schedules, Hostel details, Fees, Admission Stages (CAP), Seat Acceptance (Freeze/Float/Betterment), Anti-Ragging procedures,Reservation Norms and Attendance Rules..
 - CRITICAL: Hostel "Block C" structure, Dates for exams (MST/ESE), class start dates, and holiday schedules is ONLY in the PDF. NEVER use SQL for hostels.
 
 SQL RULES (STRICT SCHEMA MAPPING):
@@ -162,6 +162,20 @@ DOCUMENT LOGIC MAPPING (HOSTEL):
 - ERP PORTAL: For questions about "where to register" or "registration site", identify the Official VJTI ERP Portal URL: https://erp.vjti.ac.in/.
 - MAJOR EVENTS: Technovanza is held in December/January. Pratibimb is held in February.
 - ANTI-RAGGING: Step 1: Informal (Warden/Faculty). Step 2: Formal Written (Box/Dr. Gangopadhyay). Step 3: Online (UGC portal). Step 4: Committee Enquiry.
+
+- RESERVATION NORMS (PDF ONLY — NEVER USE SQL):
+  * Constitutional Reservations (Maharashtra domicile only):
+    SC=13%, ST=7%, VJ/DT(A)=3%, NT-B=2.5%, NT-C=3.5%, NT-D=2%, SBC=2%, OBC=19%, EWS=10% (over & above intake).
+  * Female Reservation: 30% WITHIN every category (horizontal). Vacant female seats go to males of SAME category.
+  * PwD Quota: 5% of total intake. Minimum 40% disability required. Horizontal reservation.
+  * Defense Quota: 5%. Covers Def-1 (ex-service), Def-2 (active service), Def-3 (active, transferred to MH). Parent must be Maharashtra domicile.
+  * Orphan Reservation: 1%, within Open category only.
+  * TFWS: 5% over & above intake. Family income < ₹8 LPA. Benefit = 100% tuition fee waiver ONLY. Development fees still apply.
+  * All India Quota (AI): Filled via JEE Main. Minority of seats. Majority filled via MHT-CET for Maharashtra candidates.
+  * Non-Creamy Layer Certificate: MANDATORY for OBC, VJ/DT, NT, SBC candidates.
+  * Conversion Rule: Vacant seats after Round III are converted to other categories per inter-se-merit rules.
+  * Domicile Rule: ALL reservations (constitutional + special) apply ONLY to Maharashtra domicile candidates.
+  * CRITICAL: Do NOT invent percentages. If a category is not listed above, say you don't have that info.
 
 FEE POLICY (CRITICAL):
 - For any questions regarding tuition fees, development fees, or total annual amounts, DO NOT state any numerical figures or currency amounts.

@@ -15,13 +15,16 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_community.utilities import SQLDatabase
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from flask import send_from_directory
+
 
 app = Flask(__name__)
 CORS(app)
 
 # ── Configuration ──
 MODEL_NAME = "llama3"
-DOCS_FOLDER = "./campus_documents"
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+DOCS_FOLDER = os.path.join(BASE_DIR, "campus_documents")
 
 # ── Connect to databases ──
 db = SQLDatabase.from_uri("sqlite:///campus.db")
@@ -103,7 +106,7 @@ SYSTEM_INSTRUCTION = """You are the VJTI Smart Campus Assistant.
 
 ROUTING PRIORITY (CRITICAL):
 - Use 'Campus_SQL_Data' (or simply 'SQL') for: Lists of programs, intake numbers, faculty locations, HOD names, and cutoffs.
-- Use 'PDF_Knowledge_Base' (or simply 'PDF') for: Hostel structure, room counts, fees, policies, academic calendars, important dates/schedules, Hostel details, Fees, Admission Stages (CAP), Seat Acceptance (Freeze/Float/Betterment), Anti-Ragging procedures, and Attendance Rules.
+- Use 'PDF_Knowledge_Base' (or simply 'PDF') for: Hostel structure, room counts, fees, policies, academic calendars, important dates/schedules, Hostel details, Fees, Admission Stages (CAP), Seat Acceptance (Freeze/Float/Betterment), Anti-Ragging procedures,Reservation Norms and Attendance Rules.
 - CRITICAL: Hostel "Block C" structure, Dates for exams (MST/ESE), class start dates, and holiday schedules is ONLY in the PDF. NEVER use SQL for hostels.
 
 SQL RULES (STRICT SCHEMA MAPPING):
@@ -161,6 +164,20 @@ DOCUMENT LOGIC MAPPING (HOSTEL):
 - MAJOR EVENTS: Technovanza is held in December/January. Pratibimb is held in February.
 - ANTI-RAGGING: Step 1: Informal (Warden/Faculty). Step 2: Formal Written (Box/Dr. Gangopadhyay). Step 3: Online (UGC portal). Step 4: Committee Enquiry.
 
+- RESERVATION NORMS (PDF ONLY — NEVER USE SQL):
+  * Constitutional Reservations (Maharashtra domicile only):
+    SC=13%, ST=7%, VJ/DT(A)=3%, NT-B=2.5%, NT-C=3.5%, NT-D=2%, SBC=2%, OBC=19%, EWS=10% (over & above intake).
+  * Female Reservation: 30% WITHIN every category (horizontal). Vacant female seats go to males of SAME category.
+  * PwD Quota: 5% of total intake. Minimum 40% disability required. Horizontal reservation.
+  * Defense Quota: 5%. Covers Def-1 (ex-service), Def-2 (active service), Def-3 (active, transferred to MH). Parent must be Maharashtra domicile.
+  * Orphan Reservation: 1%, within Open category only.
+  * TFWS: 5% over & above intake. Family income < ₹8 LPA. Benefit = 100% tuition fee waiver ONLY. Development fees still apply.
+  * All India Quota (AI): Filled via JEE Main. Minority of seats. Majority filled via MHT-CET for Maharashtra candidates.
+  * Non-Creamy Layer Certificate: MANDATORY for OBC, VJ/DT, NT, SBC candidates.
+  * Conversion Rule: Vacant seats after Round III are converted to other categories per inter-se-merit rules.
+  * Domicile Rule: ALL reservations (constitutional + special) apply ONLY to Maharashtra domicile candidates.
+  * CRITICAL: Do NOT invent percentages. If a category is not listed above, say you don't have that info.
+
 FEE POLICY (CRITICAL):
 - For any questions regarding tuition fees, development fees, or total annual amounts, DO NOT state any numerical figures or currency amounts.
 - Inform the user that the fee structure is complex due to various categories (Open, Reserved, TFWS).
@@ -173,13 +190,207 @@ TO USE A TOOL, respond ONLY with this JSON format:
 # ── Per-session conversation history ──
 sessions = {}
 
+# ═════════════════════════════════════════════════════════════════════════════
+# INTERCEPT STACK  (evaluated top-to-bottom in chat_endpoint)
+#
+#  Layer 0 — _get_serve_pdf()        : serve fee/calendar PDF file directly
+#  Layer 1 — _is_forced_pdf()        : force PDF_Knowledge_Base tool
+#  Layer 2 — _try_hardcoded_answer() : return known reservation % instantly
+#  Layer 3 — normal LLM routing
+# ═════════════════════════════════════════════════════════════════════════════
 
+# ── Layer 0: Direct PDF serve ─────────────────────────────────────────────────
+# Trigger phrases that mean the user wants fee/calendar info.
+# Kept as full phrases so single-word category mentions (obc, ews, sc …)
+# in cutoff/eligibility questions do NOT accidentally match.
+FEE_TRIGGER_PHRASES = {
+    "fee structure", "fees structure", "tuition fee", "how much is the fee",
+    "what are the fees", "what is the fee", "fee for", "fees for",
+    "annual fee", "semester fee", "total fee", "development fee",
+    "hostel fee", "mess fee",
+}
+CALENDAR_TRIGGER_PHRASES = {
+    "academic calendar", "class schedule", "exam schedule", "exam dates",
+    "mst date", "mst dates", "ese date", "ese dates", "holiday list",
+    "holiday schedule", "class start date", "class end date",
+    "semester start", "semester end", "registration date",
+    "last date to register", "when do classes start", "when do classes end",
+    "odd semester calendar", "even semester calendar",
+}
+
+# Fee file routing — first match wins
+FEE_FILE_ROUTING = [
+    ({"working professional", "wp", "weekend"},       "Fees_Working_Professionals_UG_PG_2025_26.pdf"),
+    ({"hostel fee", "hostel fees"},                   "Fees_Hostel_FY_and_Lateral_Entry_2025_26.pdf"),
+    ({"lateral", "direct second year", "dsy"},        "Fees_BTech_Direct_Second_Year_Lateral_2025_26.pdf"),
+    ({"sy", "second year", "third year", "mtech",
+      "m.tech"},                                      "Fees_SY_Onwards_BTech_MTech_MCA_PhD_2025_26.pdf"),
+    ({"fy", "first year", "mca", "phd"},              "Fees_FY_BTech_MTech_MCA_PhD_2025_26.pdf"),
+]
+
+# Calendar file routing — first match wins
+CALENDAR_FILE_ROUTING = [
+    ({"diploma"},                                     "Calendar_Diploma_2025_26.pdf"),
+    ({"working professional", "wp", "dsy"},           "Calendar_DSY_WP_BTech_MTech_2025_26.pdf"),
+    ({"fy", "first year"},                            "Calendar_FY_BTech_MCA_MTech_PhD_2025_26.pdf"),
+    ({"sy", "second year", "sy onwards", "senior"},   "Calendar_SY_Onwards_BTech_MCA_MTech_PhD_2025_26.pdf"),
+]
+
+
+def _get_serve_pdf(user_message: str) -> "tuple[str, str] | None":
+    """
+    Returns (pdf_filename, friendly_message) when the question is about fees
+    or academic calendars — the PDF is served directly, LLM is bypassed.
+    Returns None to continue with normal flow.
+    """
+    msg = user_message.lower()
+
+    if any(phrase in msg for phrase in FEE_TRIGGER_PHRASES):
+        for keywords, filename in FEE_FILE_ROUTING:
+            if any(kw in msg for kw in keywords):
+                return (filename,
+                        "Here is the relevant fee structure PDF. Fees vary by program and "
+                        "category (Open/Reserved/TFWS) — please check the applicable section.")
+        return ("Fees_FY_BTech_MTech_MCA_PhD_2025_26.pdf",
+                "Here is the fee structure PDF. If you need a different program's fees "
+                "(SY/MTech/WP/Hostel), please specify.")
+
+    if any(phrase in msg for phrase in CALENDAR_TRIGGER_PHRASES):
+        for keywords, filename in CALENDAR_FILE_ROUTING:
+            if any(kw in msg for kw in keywords):
+                return (filename,
+                        "Here is the academic calendar PDF. Check the relevant semester "
+                        "section for exact dates.")
+        return ("Calendar_SY_Onwards_BTech_MCA_MTech_PhD_2025_26.pdf",
+                "Here is the academic calendar PDF. If you need a different program's "
+                "calendar (FY/Diploma/WP), please specify.")
+
+    return None
+
+
+# ── Layer 1: Forced PDF routing ───────────────────────────────────────────────
+# Forces PDF_Knowledge_Base before the LLM decides.
+# "obc", "ews", "sc", "st" intentionally excluded so cutoff queries route to SQL.
+PDF_FORCE_KEYWORDS = {
+    "reservation", "quota", "reserve", "reserved",
+    "vj/dt", "denotified", "nomadic tribe",
+    "nt-b", "nt-c", "nt-d",
+    "non-creamy", "non creamy", "creamy layer",
+    "tfws", "tuition fee waiver", "fee waiver",
+    "domicile", "pwd quota", "disability quota", "benchmark disability",
+    "defense quota", "defence quota", "def-1", "def-2", "def-3",
+    "ex-service", "orphan reservation",
+    "all india quota", "ai quota", "jee main quota",
+    "constitutional reservation", "inter-se-merit",
+    "conversion rule", "seat conversion",
+    "cap round", "freeze", "float", "betterment",
+    "anti-ragging", "anti ragging", "ragging",
+    "attendance rule", "attendance policy",
+}
+
+
+def _is_forced_pdf(user_message: str) -> bool:
+    """Return True if the message must go to PDF_Knowledge_Base regardless of LLM routing."""
+    return any(kw in user_message.lower() for kw in PDF_FORCE_KEYWORDS)
+
+
+# ── Layer 2: Hardcoded reservation facts ─────────────────────────────────────
+# Only fires when the question is EXCLUSIVELY about a reservation percentage.
+RESERVATION_FACTS = {
+    "sc":      ("SC (Scheduled Castes)",                       "13%",   "of total sanctioned intake. Maharashtra domicile required."),
+    "st":      ("ST (Scheduled Tribes)",                       "7%",    "of total sanctioned intake. Maharashtra domicile required."),
+    "vj":      ("VJ/DT-A (Vimukta Jati / Denotified Tribes)", "3%",    "of total sanctioned intake. Non-Creamy Layer certificate required."),
+    "nt-b":    ("NT-B (Nomadic Tribes B)",                     "2.5%",  "of total sanctioned intake. Non-Creamy Layer certificate required."),
+    "nt-c":    ("NT-C (Nomadic Tribes C)",                     "3.5%",  "of total sanctioned intake. Non-Creamy Layer certificate required."),
+    "nt-d":    ("NT-D (Nomadic Tribes D)",                     "2%",    "of total sanctioned intake. Non-Creamy Layer certificate required."),
+    "sbc":     ("SBC (Special Backward Class)",                "2%",    "of total sanctioned intake. Non-Creamy Layer certificate required."),
+    "obc":     ("OBC (Other Backward Classes)",                "19%",   "of total sanctioned intake. Non-Creamy Layer certificate required."),
+    "ews":     ("EWS (Economically Weaker Section)",           "10%",   "OVER AND ABOVE sanctioned intake. Maharashtra domicile required."),
+    "tfws":    ("TFWS (Tuition Fee Waiver Scheme)",            "5%",    "over and above intake. Family income < ₹8 LPA. Tuition fee only — development fees still apply."),
+    "pwd":     ("PwD (Persons with Disability)",               "5%",    "of total intake. Minimum 40% disability. Horizontal reservation."),
+    "defense": ("Defense Quota",                               "5%",    "for children of ex-service (Def-1), active service (Def-2), active personnel transferred to MH (Def-3). Parent must be Maharashtra domicile."),
+    "orphan":  ("Orphan Reservation",                          "1%",    "within the Open category only."),
+    "female":  ("Female Reservation",                          "30%",   "WITHIN every category (horizontal). Vacant female seats go to males of the SAME category."),
+}
+
+_CATEGORY_TRIGGERS = {
+    "nt-c": "nt-c", "ntc": "nt-c", "nt c": "nt-c",
+    "nt-b": "nt-b", "ntb": "nt-b", "nt b": "nt-b",
+    "nt-d": "nt-d", "ntd": "nt-d", "nt d": "nt-d",
+    "obc": "obc", "other backward class": "obc",
+    "scheduled caste": "sc", "scheduled tribe": "st",
+    "ews": "ews", "economically weaker": "ews",
+    "sbc": "sbc", "special backward class": "sbc",
+    "vj/dt": "vj", "vimukta": "vj", "denotified": "vj",
+    "tfws": "tfws", "fee waiver": "tfws",
+    "pwd": "pwd", "persons with disability": "pwd",
+    "defense quota": "defense", "defence quota": "defense",
+    "orphan": "orphan",
+    "female reservation": "female", "women reservation": "female",
+}
+
+_DISQUALIFYING_TERMS = {
+    "percentile", "cutoff", "cut-off", "cleared", "eligible", "get admission",
+    "which branch", "what branch", "branch can", "can i get",
+    "floor", "block", "hostel", "room", "intake", "seats available",
+    "program", "faculty", "hod", "professor", "course", "score", "rank", "marks",
+}
+
+
+def _try_hardcoded_answer(user_message: str) -> "str | None":
+    """
+    Returns a pre-built answer ONLY when the question is purely about a
+    reservation category percentage. Returns None for everything else.
+    """
+    msg_lower = user_message.lower()
+
+    # Gate 1: bail if any disqualifying context word is present
+    if any(t in msg_lower for t in _DISQUALIFYING_TERMS):
+        return None
+
+    # Gate 2: must explicitly ask about a percentage / quota size
+    MUST_HAVE = [
+        "percentage", "percent", "% reserved", "how much is reserved",
+        "how much", "what is the reservation", "reserved for me",
+        "quota for", "reservation for", "what percentage",
+        "what percent", "belong to", "what is reserved",
+    ]
+    if not any(t in msg_lower for t in MUST_HAVE):
+        return None
+
+    # Gate 3: must match a specific category trigger
+    matched_key = None
+    for trigger, key in _CATEGORY_TRIGGERS.items():
+        if trigger in msg_lower:
+            matched_key = key
+            break
+
+    if matched_key and matched_key in RESERVATION_FACTS:
+        name, pct, detail = RESERVATION_FACTS[matched_key]
+        return (
+            f"**{name}: {pct}** {detail}\n\n"
+            f"*(Source: Reservation_Norms.pdf — VJTI Admission Reservation Norms & Quota System 2025-26)*"
+        )
+    return None
+
+
+# ── _build_final_task_note (used inside chat_endpoint after tool execution) ───
 def _build_final_task_note(tool_name: str, user_message: str) -> str:
     """Returns the context-sensitive grounding instruction appended to tool output."""
     if tool_name in ["Campus_SQL_Data", "SQL"]:
         return "CRITICAL: Ensure your table includes 'branch' and 'category'. Do not guess data."
 
     u_q_l = user_message.lower()
+
+    if _is_forced_pdf(user_message):
+        return (
+            "ABSOLUTE NUMBER LOCK: You MUST copy the EXACT percentage figures from the "
+            "RETRIEVED DOCUMENT CONTENT above. DO NOT add, subtract, round, or compute "
+            "any numbers. DO NOT use your training knowledge. "
+            "If you see 'OBC: 19%' in the text, you say 19%. "
+            "If a specific figure is NOT present in the document, say 'I don't have that info'. "
+            "Cite [OFFICIAL SOURCE] at the end."
+        )
     if any(k in u_q_l for k in ["hostel", "block", "room", "stay"]):
         return "STRICT NUMERICAL ACCURACY: Identify specific room counts for EACH floor from the text. Cite the source."
     elif "technovanza" in u_q_l or "pratibimb" in u_q_l:
@@ -214,14 +425,46 @@ def chat_endpoint():
     system_message = SystemMessage(content=SYSTEM_INSTRUCTION)
 
     chat_history.append(HumanMessage(content=user_message))
-    messages_to_send = [system_message] + chat_history[-6:]
 
-    response = llm.invoke(messages_to_send)
-    content  = response.content.strip()
+    # ── Layer 0: Direct PDF serve (fees / calendars) ──
+    serve = _get_serve_pdf(user_message)
+    if serve:
+        pdf_filename, friendly_msg = serve
+        print(f"📄 Serving PDF directly: {pdf_filename}")
+        chat_history.append(AIMessage(content=friendly_msg))
+        if len(chat_history) > 20:
+            sessions[session_id] = chat_history[-10:]
+        return jsonify({
+            "reply":          friendly_msg,
+            "serve_pdf":      pdf_filename,
+            "serve_pdf_path": os.path.join(DOCS_FOLDER, pdf_filename),
+        })
 
-    json_match = re.search(
-        r'\{.*"tool":\s*"(.*?)",\s*"query":\s*"(.*?)"\s*\}', content, re.DOTALL
-    )
+    # ── Layer 2: Hardcoded reservation fact ──
+    hardcoded = _try_hardcoded_answer(user_message)
+    if hardcoded:
+        print(f"📋 Hardcoded fact returned for: '{user_message}'")
+        chat_history.append(AIMessage(content=hardcoded))
+        if len(chat_history) > 20:
+            sessions[session_id] = chat_history[-10:]
+        return jsonify({"reply": hardcoded, "source_file": "Reservation_Norms.pdf"})
+
+    # ── Layer 1: Forced PDF routing ──
+    if _is_forced_pdf(user_message):
+        print(f"🔒 Forced PDF routing for: '{user_message}'")
+        safe_query = user_message.replace('"', "'")
+        content    = f'{{"tool": "PDF_Knowledge_Base", "query": "{safe_query}"}}'
+        json_match = re.search(
+            r'\{.*"tool":\s*"(.*?)",\s*"query":\s*"(.*?)"\s*\}', content, re.DOTALL
+        )
+    else:
+        # ── Layer 3: Normal LLM routing ──
+        messages_to_send = [system_message] + chat_history[-6:]
+        response         = llm.invoke(messages_to_send)
+        content          = response.content.strip()
+        json_match       = re.search(
+            r'\{.*"tool":\s*"(.*?)",\s*"query":\s*"(.*?)"\s*\}', content, re.DOTALL
+        )
 
     bot_text    = content
     source_file = None
@@ -238,23 +481,42 @@ def chat_endpoint():
 
                 final_task_note = _build_final_task_note(tool_name, user_message)
 
-                chat_history.append(AIMessage(content=content))
-                tool_output_msg = HumanMessage(
-                    content=(
-                        f"TOOL OUTPUT:\n{result}\n\n"
-                        f"FINAL TASK: Based ONLY on this data, answer: '{user_message}'. {final_task_note}"
+                if tool_name in ["Campus_SQL_Data", "SQL"]:
+                    # SQL: sliding window — needs conversational context
+                    chat_history.append(AIMessage(content=content))
+                    chat_history.append(HumanMessage(
+                        content=(
+                            f"TOOL OUTPUT:\n{result}\n\n"
+                            f"FINAL TASK: Based ONLY on this data, answer: '{user_message}'. {final_task_note}"
+                        )
+                    ))
+                    final_response = llm.invoke([system_message] + chat_history[-6:])
+                else:
+                    # PDF: isolated call — no chat history so training weights
+                    # cannot override what the document actually says.
+                    isolated_prompt = HumanMessage(
+                        content=(
+                            f"RETRIEVED DOCUMENT CONTENT:\n{result}\n\n"
+                            f"---\n"
+                            f"USER QUESTION: {user_message}\n\n"
+                            f"INSTRUCTION: {final_task_note}\n"
+                            f"Find the exact sentence or bullet in the RETRIEVED DOCUMENT CONTENT "
+                            f"that answers the question. Copy the number/fact VERBATIM. "
+                            f"Do not use any other knowledge."
+                        )
                     )
-                )
-                chat_history.append(tool_output_msg)
+                    final_response = llm.invoke([system_message, isolated_prompt])
+                    chat_history.append(AIMessage(content=content))
+                    chat_history.append(HumanMessage(
+                        content=f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: answer '{user_message}'. {final_task_note}"
+                    ))
 
-                final_response = llm.invoke([system_message] + chat_history[-6:])
                 bot_text = final_response.content
+                chat_history.append(final_response)
 
                 source_match = re.search(r'([A-Za-z0-9_\-]+\.pdf)', bot_text)
                 if source_match:
                     source_file = source_match.group(1)
-
-                chat_history.append(final_response)
             else:
                 bot_text = "[Internal Error] Invalid tool selected."
         except Exception as e:
@@ -320,6 +582,19 @@ def sessions_endpoint():
 def health():
     """Health-check endpoint."""
     return jsonify({"status": "ok", "model": MODEL_NAME})
+
+
+@app.route("/debug/docs", methods=["GET"])
+def debug_docs():
+    import glob
+    files = glob.glob(os.path.join(DOCS_FOLDER, "*.pdf"))
+    return {"docs_folder": DOCS_FOLDER, "exists": os.path.isdir(DOCS_FOLDER), "pdf_files": sorted([os.path.basename(f) for f in files])}
+
+
+@app.route("/docs/<path:filename>", methods=["GET"])
+def serve_document(filename):
+    """Serve PDFs from campus_documents."""
+    return send_from_directory(DOCS_FOLDER, filename)
 
 
 # ── Entry point ──
