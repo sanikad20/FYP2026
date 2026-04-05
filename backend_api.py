@@ -374,6 +374,239 @@ def _try_hardcoded_answer(user_message: str) -> "str | None":
     return None
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# _detect_intent: eliminates LLM Call #1 for known SQL query patterns
+#
+# Returns (tool_name, sql_query_string) when the question matches a known
+# pattern — the LLM routing call is skipped entirely (~3-5s saved).
+# Returns None for anything ambiguous so existing Layer 0/1/2/3 handles it.
+#
+# Rules mirror the system prompt EXACTLY:
+#   - LIKE for all string filters
+#   - Synonym mapping (IT → Information Technology, EXTC → Electronics & Telecom)
+#   - cutoffs always include category column
+#   - HOD always uses LIKE '%HOD%'
+#   - category codes: OPENS, OBCS, SCS, STS, EWS
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Dept/branch synonym map (user term → SQL LIKE pattern)
+_DEPT_SYNONYMS = {
+    "information technology": "%Information Technology%",
+    " it ":                   "%Information Technology%",
+    "it dept":                "%Information Technology%",
+    "it branch":              "%Information Technology%",
+    "extc":                   "%Electronics & Telecom%",
+    "entc":                   "%Electronics & Telecom%",
+    "electronics and telecommunication": "%Electronics & Telecom%",
+    "electronics & telecom":  "%Electronics & Telecom%",
+    "telecommunication":      "%Electronics & Telecom%",
+    "electronics engineering":"%Electronics Engineering%",
+    "computer":               "%Computer%",
+    "mechanical":             "%Mechanical%",
+    "civil":                  "%Civil%",
+    "electrical":             "%Electrical%",
+    "production":             "%Production%",
+    "textile":                "%Textile%",
+    "chemical":               "%Chemical%",
+    "mca":                    "%MCA%",
+}
+
+# Category code map (user term → SQL LIKE pattern for cutoffs table)
+_CATEGORY_CODES = {
+    "open":               "%OPENS%",
+    "general":            "%OPENS%",
+    "obc":                "%OBCS%",
+    "sc ":                "%SCS%",
+    "scheduled caste":    "%SCS%",
+    "st ":                "%STS%",
+    "scheduled tribe":    "%STS%",
+    "ews":                "%EWS%",
+    "economically weaker":"%EWS%",
+}
+
+
+def _extract_dept(msg: str) -> "str | None":
+    """Return SQL LIKE pattern for department/branch mentioned in msg."""
+    for term, pattern in _DEPT_SYNONYMS.items():
+        if term in msg:
+            return pattern
+    return None
+
+
+def _extract_category(msg: str) -> "str | None":
+    """Return SQL LIKE pattern for reservation category mentioned in msg."""
+    for term, pattern in _CATEGORY_CODES.items():
+        if term in msg:
+            return pattern
+    return None
+
+
+def _extract_year(msg: str) -> int:
+    """Extract a 4-digit year if present, default to 2025."""
+    m = re.search(r"\b(202[0-9])\b", msg)
+    return int(m.group(1)) if m else 2025
+
+
+def _detect_intent(user_message: str) -> "tuple[str, str] | None":
+    """
+    Fast Python pattern matching that returns (tool_name, sql_query) for
+    known query types, eliminating LLM Call #1 entirely.
+    Returns None for anything ambiguous — existing layers handle the rest.
+
+    Covers:
+      1. HOD / Head of Department queries
+      2. Faculty info (email, cabin, designation, full dept list)
+      3. Cutoff queries (branch, category, year)
+      4. Eligibility queries (percentile → which branches can I get)
+      5. Program / intake queries (BTech, MTech, Diploma)
+    """
+    msg = user_message.lower().strip()
+
+    # ── 1. HOD queries ────────────────────────────────────────────────────────
+    is_hod = any(k in msg for k in [
+        "hod", "head of department", "head of the department",
+        "department head", "hod of", "hod for",
+    ])
+    if is_hod:
+        dept = _extract_dept(msg)
+        if dept:
+            return ("Campus_SQL_Data",
+                    f"SELECT name, department, designation, email, cabin_location "
+                    f"FROM faculty WHERE designation LIKE '%HOD%' "
+                    f"AND department LIKE '{dept}';")
+        return ("Campus_SQL_Data",
+                "SELECT name, department, designation, email, cabin_location "
+                "FROM faculty WHERE designation LIKE '%HOD%';")
+
+    # ── 2. Faculty queries ────────────────────────────────────────────────────
+    is_faculty = any(k in msg for k in [
+        "faculty", "professor", "lecturer", "staff", "teacher",
+        "who teaches", "find faculty", "show faculty",
+    ])
+    wants_email = any(k in msg for k in ["email", "mail", "contact"])
+    wants_cabin = any(k in msg for k in ["cabin", "office", "room location", "where is", "located"])
+
+    if is_faculty:
+        dept = _extract_dept(msg)
+        if wants_email and dept:
+            return ("Campus_SQL_Data",
+                    f"SELECT name, department, email FROM faculty "
+                    f"WHERE department LIKE '{dept}';")
+        if wants_cabin and dept:
+            return ("Campus_SQL_Data",
+                    f"SELECT name, department, cabin_location FROM faculty "
+                    f"WHERE department LIKE '{dept}';")
+        if dept:
+            return ("Campus_SQL_Data",
+                    f"SELECT name, designation, email, cabin_location FROM faculty "
+                    f"WHERE department LIKE '{dept}';")
+        if any(k in msg for k in ["all faculty", "list of faculty", "all professors", "all staff"]):
+            return ("Campus_SQL_Data",
+                    "SELECT name, department, designation FROM faculty ORDER BY department;")
+        # faculty mentioned but no dept and not a list request — fall through
+        return None
+
+    # ── 3. Cutoff queries ─────────────────────────────────────────────────────
+    is_cutoff = any(k in msg for k in [
+        "cutoff", "cut off", "cut-off", "closing percentile",
+        "last rank", "minimum percentile", "opening percentile",
+        "what was the cutoff", "cutoffs for",
+    ])
+    if is_cutoff:
+        dept     = _extract_dept(msg)
+        category = _extract_category(msg)
+        year     = _extract_year(msg)
+
+        if dept and category:
+            return ("Campus_SQL_Data",
+                    f"SELECT branch, category, percentile FROM cutoffs "
+                    f"WHERE branch LIKE '{dept}' "
+                    f"AND category LIKE '{category}' AND year = {year};")
+        if dept:
+            # No category filter — show all categories for that branch
+            return ("Campus_SQL_Data",
+                    f"SELECT branch, category, percentile FROM cutoffs "
+                    f"WHERE branch LIKE '{dept}' AND year = {year} "
+                    f"ORDER BY category;")
+        if category:
+            return ("Campus_SQL_Data",
+                    f"SELECT branch, category, percentile FROM cutoffs "
+                    f"WHERE category LIKE '{category}' AND year = {year} "
+                    f"ORDER BY percentile DESC;")
+        # cutoff asked without branch/category — LLM needed to clarify
+        return None
+
+    # ── 4. Eligibility / "what can I get" queries ─────────────────────────────
+    is_eligibility = any(k in msg for k in [
+        "what can i get", "which branch can i", "which branches can i",
+        "what did i clear", "am i eligible", "can i get admission",
+        "branches can i get", "my percentile is", "i have",
+        "i scored", "i got", "with my percentile",
+    ])
+    has_number = bool(re.search(r"\b\d{2,3}(\.\d+)?\b", msg))
+
+    if is_eligibility and has_number:
+        num_match  = re.search(r"\b(\d{2,3}(\.\d+)?)\b", msg)
+        percentile = num_match.group(1) if num_match else None
+        category   = _extract_category(msg)
+        year       = _extract_year(msg)
+
+        if percentile and category:
+            return ("Campus_SQL_Data",
+                    f"SELECT branch, category, percentile FROM cutoffs "
+                    f"WHERE percentile <= {percentile} "
+                    f"AND category LIKE '{category}' AND year = {year} "
+                    f"ORDER BY percentile DESC;")
+        if percentile:
+            return ("Campus_SQL_Data",
+                    f"SELECT branch, category, percentile FROM cutoffs "
+                    f"WHERE percentile <= {percentile} AND year = {year} "
+                    f"ORDER BY percentile DESC;")
+
+    # ── 5. Program / intake queries ───────────────────────────────────────────
+    is_intake  = any(k in msg for k in ["intake", "how many seats", "total seats", "number of seats"])
+    is_program = any(k in msg for k in [
+        "programs offered", "courses offered", "what programs",
+        "list of programs", "list of courses", "available programs",
+    ])
+    is_mtech   = any(k in msg for k in ["mtech", "m.tech", "postgraduate", "pg program"])
+    is_btech   = any(k in msg for k in ["btech", "b.tech", "undergraduate", "ug program"])
+    is_diploma = "diploma" in msg
+
+    if is_intake or is_program or is_mtech or is_btech or is_diploma:
+        dept = _extract_dept(msg)
+
+        if is_mtech:
+            base = "SELECT program_name, intake, duration_years FROM programs WHERE level = 'Postgraduate'"
+            return ("Campus_SQL_Data",
+                    f"{base} AND department LIKE '{dept}';" if dept else f"{base} ORDER BY department;")
+
+        if is_btech:
+            base = "SELECT program_name, intake FROM programs WHERE level = 'Undergraduate'"
+            return ("Campus_SQL_Data",
+                    f"{base} AND department LIKE '{dept}';" if dept else f"{base} ORDER BY department;")
+
+        if is_diploma:
+            base = "SELECT program_name, intake FROM programs WHERE program_name LIKE '%Diploma%'"
+            return ("Campus_SQL_Data",
+                    f"{base} AND department LIKE '{dept}';" if dept else f"{base};")
+
+        if dept:
+            return ("Campus_SQL_Data",
+                    f"SELECT program_name, level, intake FROM programs "
+                    f"WHERE department LIKE '{dept}';")
+
+        if is_program:
+            return ("Campus_SQL_Data",
+                    "SELECT program_name, level, department, intake FROM programs "
+                    "ORDER BY level, department;")
+
+    # ── No confident match — return None to fall through ─────────────────────
+    return None
+
+
+
 # ── _build_final_task_note (used inside chat_endpoint after tool execution) ───
 def _build_final_task_note(tool_name: str, user_message: str) -> str:
     """Returns the context-sensitive grounding instruction appended to tool output."""
@@ -425,6 +658,33 @@ def chat_endpoint():
     system_message = SystemMessage(content=SYSTEM_INSTRUCTION)
 
     chat_history.append(HumanMessage(content=user_message))
+
+    # ── _detect_intent: skip LLM Call #1 for known SQL patterns ──────────────
+    detected = _detect_intent(user_message)
+    if detected:
+        det_tool, det_query = detected
+        print(f"⚡ Intent detected — skipping LLM routing: {det_tool}")
+        print(f"   SQL: {det_query}")
+        result          = tools_map[det_tool](det_query)
+        final_task_note = _build_final_task_note(det_tool, user_message)
+        chat_history.append(HumanMessage(
+            content=(
+                f"TOOL OUTPUT:\n{result}\n\n"
+                f"FINAL TASK: Based ONLY on this data, answer: '{user_message}'. {final_task_note}"
+            )
+        ))
+        final_response = llm.invoke([system_message] + chat_history[-6:])
+        bot_text       = final_response.content
+        chat_history.append(final_response)
+        source_match = re.search(r'([A-Za-z0-9_\-]+\.pdf)', bot_text)
+        source_file  = source_match.group(1) if source_match else None
+        if len(chat_history) > 20:
+            sessions[session_id] = chat_history[-10:]
+        response_data = {"reply": bot_text}
+        if source_file:
+            response_data["source_file"] = source_file
+            response_data["source_path"] = os.path.join(DOCS_FOLDER, source_file)
+        return jsonify(response_data)
 
     # ── Layer 0: Direct PDF serve (fees / calendars) ──
     serve = _get_serve_pdf(user_message)

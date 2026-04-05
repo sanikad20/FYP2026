@@ -124,38 +124,38 @@ const Index = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isTyping]);
 
-  const handleQuickReply = (action: string) => {
-    if (action === "map" || action === "faculty" || action === "placements") {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Date.now().toString(),
-          type: "text",
-          content: `Show me ${
-            action === "map"
-              ? "campus map"
-              : action === "faculty"
-              ? "faculty list"
-              : "placement statistics"
-          }`,
-          isUser: true,
-        },
-      ]);
-      setIsTyping(true);
-      setTimeout(() => {
-        setIsTyping(false);
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: (Date.now() + 1).toString(),
-            type: action as "map" | "faculty" | "placements",
-            isUser: false,
-          },
-        ]);
-      }, 500);
-      return;
-    }
-  };
+  // const handleQuickReply = (action: string) => {
+  //   if (action === "map" || action === "faculty" || action === "placements") {
+  //     setMessages((prev) => [
+  //       ...prev,
+  //       {
+  //         id: Date.now().toString(),
+  //         type: "text",
+  //         content: `Show me ${
+  //           action === "map"
+  //             ? "campus map"
+  //             : action === "faculty"
+  //             ? "faculty list"
+  //             : "placement statistics"
+  //         }`,
+  //         isUser: true,
+  //       },
+  //     ]);
+  //     setIsTyping(true);
+  //     setTimeout(() => {
+  //       setIsTyping(false);
+  //       setMessages((prev) => [
+  //         ...prev,
+  //         {
+  //           id: (Date.now() + 1).toString(),
+  //           type: action as "map" | "faculty" | "placements",
+  //           isUser: false,
+  //         },
+  //       ]);
+  //     }, 500);
+  //     return;
+  //   }
+  // };
 
   const handleSendMessage = async (content: string) => {
     setMessages((prev) => [
@@ -280,14 +280,14 @@ const Index = () => {
                     />
                   );
                 }
-                if (message.type === "quick-reply") {
-                  return (
-                    <QuickReplyButtons
-                      key={message.id}
-                      onSelect={handleQuickReply}
-                    />
-                  );
-                }
+                // if (message.type === "quick-reply") {
+                //   return (
+                //     <QuickReplyButtons
+                //       key={message.id}
+                //       onSelect={handleQuickReply}
+                //     />
+                //   );
+                // }
                 if (message.type === "map") {
                   return <MapPreviewCard key={message.id} />;
                 }
