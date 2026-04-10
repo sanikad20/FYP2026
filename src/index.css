@@ -1,13 +1,24 @@
+@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@500&display=swap");
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/* Definition of the design system. All colors, gradients, fonts, etc should be defined here. 
+/* Definition of the design system. All colors, gradients, fonts, etc should be defined here.
 All colors MUST be HSL.
 */
 
 @layer base {
   :root {
+    --font-sans: "Manrope", "Segoe UI", sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+    --text-xs: clamp(0.73rem, 0.71rem + 0.08vw, 0.78rem);
+    --text-sm: clamp(0.86rem, 0.83rem + 0.12vw, 0.94rem);
+    --text-base: clamp(0.98rem, 0.95rem + 0.15vw, 1.05rem);
+    --text-lg: clamp(1.08rem, 1.03rem + 0.25vw, 1.2rem);
+    --text-xl: clamp(1.25rem, 1.16rem + 0.4vw, 1.45rem);
+
     /* University-inspired color palette */
     --background: 0 0% 98%;
     --foreground: 220 15% 20%;
@@ -22,7 +33,7 @@ All colors MUST be HSL.
     --primary: 220 80% 35%;
     --primary-foreground: 0 0% 100%;
     --primary-light: 220 70% 90%;
-    
+
     /* Light blue accent */
     --secondary: 210 60% 96%;
     --secondary-foreground: 220 80% 35%;
@@ -48,15 +59,23 @@ All colors MUST be HSL.
     --chat-user-fg: 0 0% 100%;
     --chat-bot-bg: 0 0% 100%;
     --chat-bot-fg: 220 15% 20%;
-    
+
     /* Gradients */
-    --gradient-primary: linear-gradient(135deg, hsl(220, 80%, 35%), hsl(220, 70%, 45%));
+    --gradient-primary: linear-gradient(
+      135deg,
+      hsl(220, 80%, 35%),
+      hsl(220, 70%, 45%)
+    );
     --gradient-card: linear-gradient(135deg, hsl(0, 0%, 100%), hsl(220, 70%, 98%));
-    
+    --gradient-shell:
+      radial-gradient(1200px 600px at 10% -10%, hsl(220 80% 94%), transparent 60%),
+      radial-gradient(800px 500px at 100% 0%, hsl(35 95% 88%), transparent 60%),
+      hsl(var(--background));
+
     /* Shadows */
     --shadow-card: 0 2px 8px -2px hsl(220 80% 35% / 0.1);
     --shadow-elevated: 0 8px 24px -4px hsl(220 80% 35% / 0.15);
-    
+
     /* Animations */
     --transition-smooth: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   }
@@ -76,7 +95,7 @@ All colors MUST be HSL.
     --primary: 220 80% 50%;
     --primary-foreground: 0 0% 100%;
     --primary-light: 220 70% 20%;
-    
+
     /* Dark blue accent */
     --secondary: 220 30% 15%;
     --secondary-foreground: 220 80% 70%;
@@ -100,7 +119,12 @@ All colors MUST be HSL.
     --chat-user-fg: 0 0% 100%;
     --chat-bot-bg: 220 20% 15%;
     --chat-bot-fg: 0 0% 95%;
-    
+
+    --gradient-shell:
+      radial-gradient(1200px 600px at 10% -10%, hsl(220 80% 18%), transparent 60%),
+      radial-gradient(800px 500px at 100% 0%, hsl(35 95% 20%), transparent 60%),
+      hsl(var(--background));
+
     /* Dark mode shadows */
     --shadow-card: 0 2px 8px -2px hsl(0 0% 0% / 0.3);
     --shadow-elevated: 0 8px 24px -4px hsl(0 0% 0% / 0.5);
@@ -114,5 +138,12 @@ All colors MUST be HSL.
 
   body {
     @apply bg-background text-foreground;
+    font-family: var(--font-sans);
+    font-size: var(--text-base);
+    line-height: 1.6;
+    letter-spacing: 0.01em;
+    background: var(--gradient-shell);
+    text-rendering: geometricPrecision;
+    -webkit-font-smoothing: antialiased;
   }
 }

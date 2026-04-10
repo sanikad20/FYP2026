@@ -1,8 +1,14 @@
 import type { Config } from "tailwindcss";
+import tailwindcssAnimate from "tailwindcss-animate";
 
 export default {
   darkMode: ["class"],
-  content: ["./pages/**/*.{ts,tsx}", "./components/**/*.{ts,tsx}", "./app/**/*.{ts,tsx}", "./src/**/*.{ts,tsx}"],
+  content: [
+    "./pages/**/*.{ts,tsx}",
+    "./components/**/*.{ts,tsx}",
+    "./app/**/*.{ts,tsx}",
+    "./src/**/*.{ts,tsx}",
+  ],
   prefix: "",
   theme: {
     container: {
@@ -13,6 +19,10 @@ export default {
       },
     },
     extend: {
+      fontFamily: {
+        sans: ["var(--font-sans)"],
+        mono: ["var(--font-mono)"],
+      },
       colors: {
         border: "hsl(var(--border))",
         input: "hsl(var(--input))",
@@ -89,6 +99,18 @@ export default {
           from: { transform: "translateX(-100%)", opacity: "0" },
           to: { transform: "translateX(0)", opacity: "1" },
         },
+        "typing-bar": {
+          "0%, 100%": { transform: "scaleY(0.35)", opacity: "0.45" },
+          "50%": { transform: "scaleY(1)", opacity: "1" },
+        },
+        "typing-shimmer": {
+          "0%": { backgroundPosition: "-200% 0" },
+          "100%": { backgroundPosition: "200% 0" },
+        },
+        "bubble-in": {
+          "0%": { opacity: "0", transform: "translateY(6px) scale(0.98)" },
+          "100%": { opacity: "1", transform: "translateY(0) scale(1)" },
+        },
       },
       animation: {
         "accordion-down": "accordion-down 0.2s ease-out",
@@ -96,8 +118,11 @@ export default {
         "fade-in-up": "fade-in-up 0.5s ease-out",
         "bounce-dots": "bounce-dots 1.4s infinite ease-in-out",
         "slide-in": "slide-in 0.3s ease-out",
+        "typing-bar": "typing-bar 1s ease-in-out infinite",
+        "typing-shimmer": "typing-shimmer 1.8s linear infinite",
+        "bubble-in": "bubble-in 260ms cubic-bezier(0.22, 1, 0.36, 1)",
       },
     },
   },
-  plugins: [require("tailwindcss-animate")],
+  plugins: [tailwindcssAnimate],
 } satisfies Config;

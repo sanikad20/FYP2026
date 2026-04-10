@@ -26,23 +26,25 @@ const ChatInput = ({ onSend, disabled }: ChatInputProps) => {
   };
 
   return (
-    <div className="flex items-center gap-2 p-4 border-t border-border bg-background">
-      <Input
-        value={message}
-        onChange={(e) => setMessage(e.target.value)}
-        onKeyPress={handleKeyPress}
-        placeholder="Type your question..."
-        disabled={disabled}
-        className="flex-1 bg-muted border-border focus-visible:ring-primary"
-      />
-      <Button
-        onClick={handleSend}
-        disabled={disabled || !message.trim()}
-        size="icon"
-        className="bg-primary hover:bg-primary/90 text-primary-foreground"
-      >
-        <Send className="h-4 w-4" />
-      </Button>
+    <div className="rounded-2xl border border-border/70 bg-card/80 p-3 shadow-card backdrop-blur supports-[backdrop-filter]:bg-card/60">
+      <div className="flex items-center gap-2">
+        <Input
+          value={message}
+          onChange={(e) => setMessage(e.target.value)}
+          onKeyDown={handleKeyPress}
+          placeholder="Type your question..."
+          disabled={disabled}
+          className="h-11 flex-1 border-border bg-muted/60 text-sm md:text-base placeholder:text-muted-foreground/80 focus-visible:ring-2 focus-visible:ring-primary"
+        />
+        <Button
+          onClick={handleSend}
+          disabled={disabled || !message.trim()}
+          size="icon"
+          className="h-11 w-11 rounded-xl bg-primary text-primary-foreground transition-transform duration-150 hover:scale-[1.03] hover:bg-primary/90 active:scale-95"
+        >
+          <Send className="h-4 w-4" />
+        </Button>
+      </div>
     </div>
   );
 };
