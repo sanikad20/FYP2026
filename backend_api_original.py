@@ -28,13 +28,16 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_community.utilities import SQLDatabase
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from navigation import navigation_bp, get_navigation, detect_navigation_intent
+NAV_IMAGES_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "campus_navigation_images")
 
 app = Flask(__name__)
 CORS(app)
+app.register_blueprint(navigation_bp)   # registers /api/navigate endpoints
 
 # ── Configuration ──
 ROUTING_MODEL  = "llama3.2:1b"   # fast small model — ONLY picks which tool to use
-RESPONSE_MODEL = "llama3"        # full model — writes SQL + generates the final answer
+RESPONSE_MODEL = "llama3.2:1b"        # full model — writes SQL + generates the final answer
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 DOCS_FOLDER = os.path.join(BASE_DIR, "campus_documents")
 
@@ -360,6 +363,23 @@ _FEE_SCOPE_WORDS = {
     "for", "of", "what", "total",
 }
 
+# Reservation-category phrasing should not be treated as fee/calendar intent.
+_RESERVATION_QUERY_WORDS = {
+    "reservation", "reserve", "reserved", "quota", "category",
+    "sc", "st", "obc", "ews", "nt-b", "nt-c", "nt-d", "sbc", "vj", "tfws",
+    "pwd", "female", "defense", "defence", "orphan",
+}
+
+
+def _has_term(msg: str, term: str) -> bool:
+    """Whole-term matcher to avoid accidental substring hits (e.g. 'ese' in 'reserved')."""
+    pattern = r'(?<!\w)' + re.escape(term.lower()) + r'(?!\w)'
+    return re.search(pattern, msg.lower()) is not None
+
+
+def _has_any_term(msg: str, terms) -> bool:
+    return any(_has_term(msg, t) for t in terms)
+
 
 def _is_calendar_query(msg: str) -> bool:
     """
@@ -369,17 +389,19 @@ def _is_calendar_query(msg: str) -> bool:
     """
     # Single-word triggers that are unambiguous on their own
     SOLO_TRIGGERS = {"mst", "ese"}
-    if any(t in msg for t in SOLO_TRIGGERS):
+    if _has_any_term(msg, SOLO_TRIGGERS):
         return True
-    has_signal = any(w in msg for w in _CAL_SIGNAL_WORDS)
-    has_scope  = any(w in msg for w in _CAL_SCOPE_WORDS)
+    has_signal = _has_any_term(msg, _CAL_SIGNAL_WORDS)
+    has_scope  = _has_any_term(msg, _CAL_SCOPE_WORDS)
     return has_signal and has_scope
 
 
 def _is_fee_query(msg: str) -> bool:
     """Returns True if the message is asking for a fee structure PDF."""
-    has_signal = any(w in msg for w in _FEE_SIGNAL_WORDS)
-    has_scope  = any(w in msg for w in _FEE_SCOPE_WORDS)
+    if _has_any_term(msg, _RESERVATION_QUERY_WORDS):
+        return False
+    has_signal = _has_any_term(msg, _FEE_SIGNAL_WORDS)
+    has_scope  = _has_any_term(msg, _FEE_SCOPE_WORDS)
     return has_signal and has_scope
 
 
@@ -410,7 +432,7 @@ def _get_serve_pdf(user_message: str) -> "tuple[str, str] | None":
     # ── Fee check ──
     if _is_fee_query(msg):
         for keywords, filename in FEE_FILE_ROUTING:
-            if any(kw in msg for kw in keywords):
+            if _has_any_term(msg, keywords):
                 return (filename,
                         "Here is the relevant fee structure PDF. Fees vary by program and "
                         "category (Open/Reserved/TFWS) — please check the applicable section.")
@@ -421,7 +443,7 @@ def _get_serve_pdf(user_message: str) -> "tuple[str, str] | None":
     # ── Calendar check ──
     if _is_calendar_query(msg):
         for keywords, filename in CALENDAR_FILE_ROUTING:
-            if any(kw in msg for kw in keywords):
+            if _has_any_term(msg, keywords):
                 return (filename,
                         "Here is the academic calendar PDF. Check the relevant semester "
                         "section for exact dates.")
@@ -588,9 +610,33 @@ def _generate_sql(user_message: str, intent_hint: str) -> str:
     print(f"   ✅ Extracted SQL: {clean_sql[:300]}")
     return clean_sql
 
+# add this near your other helpers (for example after _generate_sql)
+
+def _build_nav_image_url(filename: str | None) -> "str | None":
+    if not filename:
+        return None
+    safe = str(filename).strip().lstrip("/")
+    return f"/nav-images/{safe}"
+
+
+def _attach_image_urls(directions: dict | None) -> dict | None:
+    if not directions:
+        return None
+    for step in directions.get("steps", []):
+        step["image_url"] = _build_nav_image_url(step.get("image"))
+    return directions
 
 # ── Core shared logic ─────────────────────────────────────────────────────────
 def _run_routing(user_message: str, chat_history: list):
+    
+    # ── Navigation intercept (before all other layers) ──
+    nav_intent = detect_navigation_intent(user_message)
+    if nav_intent:
+        origin, destination = nav_intent
+        result = get_navigation(origin, destination)
+        result["directions"] = _attach_image_urls(result.get("directions"))
+        return ("navigation", result, None)
+    
     """
     Runs Layers 0-4 and returns either:
       ("serve_pdf",  pdf_filename, friendly_msg)  — direct PDF serve
@@ -611,28 +657,25 @@ def _run_routing(user_message: str, chat_history: list):
     # Layer 1: Forced PDF routing for policy/reservation keywords
     if _is_forced_pdf(user_message):
         safe_query = user_message.replace('"', "'")
-        content    = f'{{"tool": "PDF_Knowledge_Base", "query": "{safe_query}"}}'
+        content = f'{{"tool": "PDF_Knowledge_Base", "query": "{safe_query}"}}'
     else:
         # Layer 3: routing_llm — ONLY classifies which tool to use
-        routing_sys      = SystemMessage(content=ROUTING_SYSTEM)
+        routing_sys = SystemMessage(content=ROUTING_SYSTEM)
         messages_routing = [routing_sys, HumanMessage(content=user_message)]
         print(f"🔀 Routing with {ROUTING_MODEL}...")
         routing_response = routing_llm.invoke(messages_routing)
-        content          = routing_response.content.strip()
+        content = routing_response.content.strip()
         print(f"   Router decision: {content[:200]}")
 
-    # Parse the router's JSON output
-    # Use a lenient regex that handles extra whitespace and minor formatting differences
     json_match = re.search(
         r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"query"\s*:\s*"([^"]*?)"\s*\}',
         content, re.DOTALL
     )
 
     if json_match:
-        tool_name  = json_match.group(1).strip()
+        tool_name = json_match.group(1).strip()
         intent_hint = json_match.group(2).strip()
 
-        # Normalise tool name aliases
         if tool_name in ("SQL", "sql"):
             tool_name = "Campus_SQL_Data"
         elif tool_name in ("PDF", "pdf"):
@@ -647,8 +690,7 @@ def _run_routing(user_message: str, chat_history: list):
                 query_arg = intent_hint if intent_hint else user_message
             return ("tool", tool_name, query_arg)
 
-    # Fallback: no valid tool found, let response_llm answer directly from context
-    print(f"⚠️  Router output not parseable — falling back to direct response_llm answer")
+    print("⚠️  Router output not parseable — falling back to direct response_llm answer")
     fallback_msg = response_llm.invoke([
         SystemMessage(content=RESPONSE_SYSTEM),
         HumanMessage(content=user_message)
@@ -696,6 +738,17 @@ def chat_endpoint():
         chat_history.append(AIMessage(content=answer))
         _trim_history(session_id, chat_history)
         return jsonify({"reply": answer, "source_file": source_file})
+    
+        # ── navigation ──
+    if route_type == "navigation":
+        nav_result = arg1
+        nav_text = nav_result.get("summary", "")
+        chat_history.append(AIMessage(content=nav_text))
+        _trim_history(session_id, chat_history)
+        return jsonify({
+            "reply": nav_text,
+            "navigation": nav_result.get("directions"),
+        })
 
     # ── direct (no tool call) ──
     if route_type == "direct":
@@ -808,6 +861,17 @@ def chat_stream_endpoint():
         route_type, arg1, arg2 = _run_routing(user_message, chat_history)
 
         # ── serve_pdf ──
+                # ── navigation ──
+        if route_type == "navigation":
+            nav_result = arg1
+            nav_text = nav_result.get("summary", "")
+            chat_history.append(AIMessage(content=nav_text))
+            _trim_history(session_id, chat_history)
+            for word in nav_text.split(" "):
+                yield f"data: {json.dumps({'token': word + ' '})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'navigation': nav_result.get('directions')})}\n\n"
+            return
+        
         if route_type == "serve_pdf":
             pdf_filename, friendly_msg = arg1, arg2
             print(f"📄 Serving PDF directly: {pdf_filename}")
@@ -969,6 +1033,10 @@ def serve_document(filename):
     """Serve PDFs from campus_documents."""
     return send_from_directory(DOCS_FOLDER, filename)
 
+@app.route("/nav-images/<path:filename>", methods=["GET"])
+def serve_navigation_image(filename):
+    """Serve navigation reference images to the frontend."""
+    return send_from_directory(NAV_IMAGES_FOLDER, filename)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -977,6 +1045,7 @@ if __name__ == "__main__":
     print(f"   Routing model  : {ROUTING_MODEL}  (Call #1 — picks tool only)")
     print(f"   Response model : {RESPONSE_MODEL}  (Call #2 — writes SQL + answers)")
     print(f"   Docs folder    : {DOCS_FOLDER}")
+    print(f"   Navigation images folder : {NAV_IMAGES_FOLDER}")
     print(f"   Endpoints      : /api/chat         (JSON)")
     print(f"                    /api/chat/stream  (SSE streaming)")
     print("=" * 60)

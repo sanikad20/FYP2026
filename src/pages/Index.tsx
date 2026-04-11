@@ -10,18 +10,56 @@ import PlacementChart from "@/components/chat/PlacementChart";
 import ChatInput from "@/components/chat/ChatInput";
 import { AppSidebar } from "@/components/AppSidebar";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
-import { sendMessage, checkHealth } from "@/lib/chatApi";
+import { sendMessage, checkHealth, NavigationData } from "@/lib/chatApi";
 import { toast } from "sonner";
 
 interface Message {
   id: string;
-  type: "text" | "quick-reply" | "map" | "faculty" | "placements" | "pdf";
+  type: "text" | "quick-reply" | "map" | "faculty" | "placements" | "pdf" | "navigation";
   content?: string;
   isUser: boolean;
   sourceFile?: string;
   servePdf?: string;
   servePdfPath?: string;
+  navigation?: NavigationData;
 }
+
+const buildPdfUrl = (filename: string, filepath?: string) => {
+  if (!filepath?.trim()) {
+    return `http://localhost:5000/docs/${encodeURIComponent(filename)}`;
+  }
+
+  // Normalize slashes for Windows paths.
+  const normalized = filepath.replace(/\\/g, "/").trim();
+
+  // If backend already sends a web path, use it directly.
+  if (normalized.startsWith("/docs/")) {
+    return `http://localhost:5000${normalized}`;
+  }
+
+  // If backend sends absolute disk path, extract basename and serve via /docs.
+  const extractedName = normalized.split("/").pop() || filename;
+  return `http://localhost:5000/docs/${encodeURIComponent(extractedName)}`;
+};
+
+const buildNavImageUrl = (imageUrl?: string | null, imageName?: string | null) => {
+  if (imageUrl && imageUrl.trim()) {
+    const normalized = imageUrl.trim();
+    if (normalized.startsWith("http://") || normalized.startsWith("https://")) {
+      return normalized;
+    }
+    if (normalized.startsWith("/")) {
+      return `http://localhost:5000${normalized}`;
+    }
+    return `http://localhost:5000/${normalized}`;
+  }
+
+  if (imageName && imageName.trim()) {
+    return `http://localhost:5000/nav-images/${encodeURIComponent(imageName)}`;
+  }
+
+  return "";
+};
 
 const PdfAttachmentCard = ({
   filename,
@@ -78,22 +116,42 @@ const PdfAttachmentCard = ({
   );
 };
 
-const buildPdfUrl = (filename: string, filepath?: string) => {
-  if (!filepath?.trim()) {
-    return `http://localhost:5000/docs/${encodeURIComponent(filename)}`;
-  }
+const NavigationCard = ({
+  title,
+  navigation,
+}: {
+  title?: string;
+  navigation: NavigationData;
+}) => {
+  return (
+    <div className="flex justify-start">
+      <div className="w-full max-w-2xl rounded-xl border border-border bg-card p-4 shadow-sm">
+        {title && <p className="mb-3 text-sm text-muted-foreground">{title}</p>}
 
-  // Normalize slashes for Windows paths.
-  const normalized = filepath.replace(/\\/g, "/").trim();
-
-  // If backend already sends a web path, use it directly.
-  if (normalized.startsWith("/docs/")) {
-    return `http://localhost:5000${normalized}`;
-  }
-
-  // If backend sends absolute disk path, extract basename and serve via /docs.
-  const extractedName = normalized.split("/").pop() || filename;
-  return `http://localhost:5000/docs/${encodeURIComponent(extractedName)}`;
+        <div className="space-y-4">
+          {navigation.steps.map((step) => {
+            const imgSrc = buildNavImageUrl(step.image_url, step.image ?? null);
+            return (
+              <div key={`${step.step}-${step.location}`} className="rounded-lg border border-border/70 p-3">
+                <p className="text-sm font-semibold">
+                  Step {step.step}: {step.location}
+                </p>
+                <p className="mt-1 text-sm text-muted-foreground">{step.instruction}</p>
+                {imgSrc ? (
+                  <img
+                    src={imgSrc}
+                    alt={`Step ${step.step} reference`}
+                    className="mt-3 w-full rounded-md border border-border object-cover"
+                    loading="lazy"
+                  />
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
 };
 
 const Index = () => {
@@ -146,6 +204,17 @@ const Index = () => {
             isUser: false,
             servePdf: response.serve_pdf,
             servePdfPath: response.serve_pdf_path,
+          },
+        ]);
+      } else if (response.navigation) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: (Date.now() + 1).toString(),
+            type: "navigation",
+            content: response.reply,
+            isUser: false,
+            navigation: response.navigation,
           },
         ]);
       } else {
@@ -236,6 +305,15 @@ const Index = () => {
                     }
                     if (message.type === "placements") {
                       return <PlacementChart key={message.id} />;
+                    }
+                    if (message.type === "navigation" && message.navigation) {
+                      return (
+                        <NavigationCard
+                          key={message.id}
+                          title={message.content}
+                          navigation={message.navigation}
+                        />
+                      );
                     }
                     if (message.type === "pdf" && message.servePdf) {
                       return (

@@ -6,12 +6,31 @@ export function resetSession() {
   sessionId = `session_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 }
 
+export interface NavigationStep {
+  step: number;
+  node_id?: string;
+  location: string;
+  instruction: string;
+  image?: string | null;
+  image_url?: string | null;
+  floor: string | number;
+}
+
+export interface NavigationData {
+  steps: NavigationStep[];
+  total_steps: number;
+  via_quad: boolean;
+  floors_involved: number[];
+}
+
 export interface ChatResponse {
   reply: string;
   source_file?: string;
   // PDF serve fields — present when backend returns a document directly
   serve_pdf?: string;
   serve_pdf_path?: string;
+  // Navigation payload — present when backend returns route steps
+  navigation?: NavigationData;
 }
 
 export async function sendMessage(message: string): Promise<ChatResponse> {
