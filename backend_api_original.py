@@ -19,6 +19,7 @@ Run once before starting:
 import os
 import json
 import re
+import sqlite3
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from flask import send_from_directory
@@ -37,7 +38,7 @@ app.register_blueprint(navigation_bp)   # registers /api/navigate endpoints
 
 # ── Configuration ──
 ROUTING_MODEL  = "llama3.2:1b"   # fast small model — ONLY picks which tool to use
-RESPONSE_MODEL = "llama3.2:1b"        # full model — writes SQL + generates the final answer
+RESPONSE_MODEL = "llama3"        # full model — writes SQL + generates the final answer
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 DOCS_FOLDER = os.path.join(BASE_DIR, "campus_documents")
 
@@ -141,8 +142,8 @@ def _extract_sql_from_text(text: str) -> str:
             if sql_lines and stripped and not any(
                 stripped.upper().startswith(kw) for kw in
                 ['SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT', 'RIGHT', 'INNER',
-                 'GROUP', 'ORDER', 'HAVING', 'LIMIT', 'AND', 'OR', 'ON',
-                 'LIKE', 'IN', 'NOT', ')', '(', '--', 'UNION']
+                'GROUP', 'ORDER', 'HAVING', 'LIMIT', 'AND', 'OR', 'ON',
+                'LIKE', 'IN', 'NOT', ')', '(', '--', 'UNION']
             ) and not stripped.startswith(('*', "'", '"', '%')):
                 break
             sql_lines.append(line)
@@ -158,6 +159,12 @@ def sql_query(query):
     print(f"   🗄️  Running SQL Query: {query[:200]}...")
     try:
         clean_query = _extract_sql_from_text(query)
+        # Common typo normalization from LLM output.
+        clean_query = re.sub(r'\bdesignatioon\b', 'designation', clean_query, flags=re.IGNORECASE)
+        clean_query = re.sub(r'\blikee\b', 'LIKE', clean_query, flags=re.IGNORECASE)
+        # Schema guardrail: `cutoffs` uses `branch` (not `department`).
+        if re.search(r'\bfrom\s+cutoffs\b', clean_query, re.IGNORECASE):
+            clean_query = re.sub(r'\bdepartment\b', 'branch', clean_query, flags=re.IGNORECASE)
         print(f"   🗄️  Cleaned SQL: {clean_query[:200]}")
         result = db.run(clean_query)
         return str(result) if result else "No matching records found in SQL."
@@ -217,7 +224,7 @@ SQL_GEN_SYSTEM = """You are a SQLite expert for the VJTI campus database.
 Write ONE valid SQLite SELECT query. Output ONLY the raw SQL — no markdown fences, no explanation, no preamble.
 
 DATABASE SCHEMA:
-- faculty(name, department, designation, email, cabin_location)
+- faculty(name, department, designation, email, aliases)
 - cutoffs(year, branch, category, percentile)
 - programs(program_name, level, department, intake, duration_years)
 
@@ -231,8 +238,23 @@ CRITICAL RULES:
    - 'Civil' → LIKE '%Civil%'
    - 'Mechanical' → LIKE '%Mechanical%'
    - 'HOD' / 'Head' / 'Head of Department' → designation LIKE '%HOD%'
+   - 'Director' → designation LIKE '%Director%'
+   - 'Deputy Director' → designation LIKE '%Deputy Director%'
+   - 'Dean' → designation LIKE '%Dean%'
+   - 'mail' / 'email' / 'contact' / 'email id' / 'mail id' → email column
+   - department aliases:
+       * CE/Civil → '%Civil%'
+       * CSE/CS/Computer → '%Computer%'
+       * IT → '%Information Technology%' OR '%Computer & IT%'
+       * EE/Electrical → '%Electrical%'
+       * EXTC/ENTC/Telecom → '%Electronics%'
+       * Mech/Mechanical → '%Mechanical%'
+       * Prod/Production → '%Production%'
+       * Textile → '%Textile%'
+       * Humanities/Management/HS → '%Humanities%'
+       * Structural/ST → '%Structural%'
    - 'email' / 'mail' / 'contact' → email column
-   - 'office' / 'room' / 'cabin' → cabin_location column
+    - 'office' / 'room' / 'cabin' in faculty context → return name + email (no cabin column in this schema)
 3. programs TABLE:
    - B.Tech → level = 'Undergraduate'
    - M.Tech → level = 'Postgraduate'
@@ -247,8 +269,21 @@ CRITICAL RULES:
    - ALWAYS include the category column in SELECT when querying cutoffs.
 5. faculty TABLE:
    - HOD query example: SELECT name, email FROM faculty WHERE designation LIKE '%HOD%' AND department LIKE '%Computer%'
+    - Director email example: SELECT name, designation, email FROM faculty WHERE designation LIKE '%Director%' ORDER BY CASE WHEN designation LIKE '%Deputy%' THEN 1 ELSE 0 END, name
+    - Dean contact example: SELECT name, designation, email FROM faculty WHERE designation LIKE '%Dean%'
 6. ELIGIBILITY: If user gives a percentile score → SELECT branch, category, percentile FROM cutoffs WHERE percentile <= <score> AND year = 2025
+7. COMPARISON QUERIES: For "compare ... between YEAR1 and YEAR2", return both years in one query using IN (...) and ORDER BY year ASC.
 7. Output ONLY the SQL query. No text before or after. No semicolons unless at the very end."""
+
+
+SQL_FIX_SYSTEM = """You repair broken SQLite SELECT queries for this exact schema.
+Return ONLY one corrected SQL query.
+
+SCHEMA:
+- faculty(name, department, designation, email)
+- cutoffs(year, branch, category, percentile)
+- programs(program_name, level, department, intake, duration_years)
+"""
 
 
 # RESPONSE_SYSTEM: used by llama3:8b for the final natural language answer.
@@ -259,11 +294,15 @@ CRITICAL RULES:
 - If the tool output is empty or says "No matching records", say clearly: "I couldn't find that information in the database. Please verify the department name or try rephrasing."
 - For SQL results: present data in a clean, readable format (table or bullet list as appropriate).
 - For PDF results: cite the [OFFICIAL SOURCE] at the end of your answer.
+- Never mention internal terms such as "TOOL OUTPUT", "router", "SQL error", or "database schema" in the final user-facing response.
 
 SQL DATA RULES:
 - Present intake numbers, cutoffs, faculty info exactly as returned — do not modify numbers.
 - If multiple rows are returned, list all of them clearly.
 - Always mention what the data represents (e.g., "The intake for B.Tech Computer Engineering is 60 students").
+- For one value, respond in one concise sentence.
+- For multiple rows, write a clean paragraph or sentence list in plain text.
+- NEVER use markdown tables, pipe symbols (`|`), or spreadsheet-style formatting.
 
 PDF DATA RULES:
 1. BLOCK VERIFICATION: When asked about a specific hostel block, ONLY use data explicitly listed under that block's heading.
@@ -549,9 +588,11 @@ def _build_final_task_note(tool_name: str, user_message: str) -> str:
     """Returns context-sensitive grounding instruction for the response model."""
     if tool_name in ["Campus_SQL_Data", "SQL"]:
         return (
-            "Present the data clearly. If the result has multiple rows, list all of them. "
-            "State what each value means (e.g. program name, intake count). "
-            "Do NOT say data is unavailable if rows are present in the TOOL OUTPUT above."
+            "Use a professional tone. For single values, give one direct sentence. "
+            "For multi-row SQL results, write a plain paragraph or sentence list (no table). "
+            "Never use pipe symbols or markdown table format. "
+            "Do not mention internal processing text (like TOOL OUTPUT or SQL errors). "
+            "If rows are present, do not claim data is unavailable."
         )
 
     u_q_l = user_message.lower()
@@ -607,8 +648,217 @@ def _generate_sql(user_message: str, intent_hint: str) -> str:
     raw_sql = sql_response.content.strip()
     print(f"   📝 Raw SQL from {RESPONSE_MODEL}: {raw_sql[:300]}")
     clean_sql = _extract_sql_from_text(raw_sql)
+    clean_sql = _sanitize_faculty_role_sql(user_message, clean_sql)
     print(f"   ✅ Extracted SQL: {clean_sql[:300]}")
     return clean_sql
+
+
+def _sanitize_faculty_role_sql(user_message: str, sql_text: str) -> str:
+    """For role-only faculty queries, remove accidental department filters from generated SQL."""
+    msg_lower = f" {user_message.lower()} "
+    sql = sql_text
+
+    is_faculty_sql = re.search(r'\bfrom\s+faculty\b', sql, re.IGNORECASE) is not None
+    asks_role = any(k in msg_lower for k in [" director", " dean", " hod", "head of department", "head "])
+    has_explicit_dept = any(
+        k in msg_lower
+        for k in [
+            " civil", " computer", " information technology", " it ", " electrical", " electronics",
+            " extc", " entc", " telecom", " mechanical", " production", " textile", " humanities", " structural"
+        ]
+    )
+
+    if not (is_faculty_sql and asks_role and not has_explicit_dept):
+        return sql
+
+    # Remove accidental department predicates when the user did not ask for a department.
+    sql = re.sub(r"\s+AND\s+department\s+LIKE\s+'[^']*'", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"department\s+LIKE\s+'[^']*'\s+AND\s+", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bWHERE\s*\)", "WHERE 1=1)", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bWHERE\s*$", "", sql, flags=re.IGNORECASE)
+    return sql
+
+
+def _fix_sql(user_message: str, bad_sql: str, sql_error: str) -> str:
+    """Attempt one SQL repair pass using the worker model and DB error context."""
+    fix_prompt = (
+        f"User question: \"{user_message}\"\n"
+        f"Broken SQL:\n{bad_sql}\n\n"
+        f"SQLite error:\n{sql_error}\n\n"
+        "Return ONLY corrected SQL for the schema."
+    )
+    fix_response = response_llm.invoke([
+        SystemMessage(content=SQL_FIX_SYSTEM),
+        HumanMessage(content=fix_prompt)
+    ])
+    repaired = _extract_sql_from_text(fix_response.content.strip())
+    print(f"   🛠️  Repaired SQL: {repaired[:300]}")
+    return repaired
+
+
+def _run_sql_with_repair(user_message: str, sql_text: str) -> tuple[str, str]:
+    """Executes SQL once, then retries once with repaired SQL if needed."""
+    result = tools_map["Campus_SQL_Data"](sql_text)
+    final_sql = sql_text
+
+    if isinstance(result, str) and result.startswith("SQL Error:"):
+        repaired_sql = _fix_sql(user_message, sql_text, result)
+        retry_result = tools_map["Campus_SQL_Data"](repaired_sql)
+        if not (isinstance(retry_result, str) and retry_result.startswith("SQL Error:")):
+            return retry_result, repaired_sql
+        return retry_result, repaired_sql
+
+    return result, final_sql
+
+
+def _dept_patterns_for_query(msg_lower: str) -> list[str]:
+    """Returns SQL LIKE patterns for detected department aliases in user query."""
+    patterns = []
+
+    alias_map = {
+        "Civil": [" civil", "civil engineering", " ce "],
+        "Computer": ["computer", " cse", " cs "],
+        "Information Technology": [" information technology", " it ", " it department"],
+        "Electrical": ["electrical", " ee "],
+        "Electronics": ["extc", "entc", "telecom", "electronics"],
+        "Mechanical": ["mechanical", " mech", " me "],
+        "Production": ["production", " prod "],
+        "Textile": ["textile"],
+        "Humanities": ["humanities", "management", " hs "],
+        "Structural": ["structural", " st "],
+    }
+
+    padded = f" {msg_lower} "
+    for pattern, keys in alias_map.items():
+        if any(k in padded for k in keys):
+            patterns.append(pattern)
+    return patterns
+
+
+def _try_faculty_contact_answer(user_message: str) -> str | None:
+    """Direct faculty contact resolver for role/name email queries (LLM bypass)."""
+    msg_lower = user_message.lower().strip()
+    asks_contact = any(k in msg_lower for k in ["mail", "email", "contact", "email id", "mail id"])
+    is_faculty_intent = any(k in msg_lower for k in ["director", "dean", "hod", "head of department", "prof", "faculty"])
+    if not (asks_contact or is_faculty_intent):
+        return None
+
+    where_clauses = []
+    params: list[str] = []
+
+    # Role filters
+    if "deputy director" in msg_lower:
+        where_clauses.append("designation LIKE ?")
+        params.append("%Deputy Director%")
+    elif "director" in msg_lower:
+        where_clauses.append("designation LIKE ?")
+        params.append("%Director%")
+
+    if "dean" in msg_lower:
+        where_clauses.append("designation LIKE ?")
+        params.append("%Dean%")
+
+    if any(k in msg_lower for k in ["hod", "head of department", "head "]):
+        where_clauses.append("designation LIKE ?")
+        params.append("%HOD%")
+
+    # Department alias filters
+    dept_patterns = _dept_patterns_for_query(msg_lower)
+    if dept_patterns:
+        dept_sub = []
+        for pat in dept_patterns:
+            dept_sub.append("department LIKE ?")
+            params.append(f"%{pat}%")
+        where_clauses.append("(" + " OR ".join(dept_sub) + ")")
+
+    where_sql = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+    sql = (
+        "SELECT name, designation, email "
+        "FROM faculty"
+        f"{where_sql} "
+        "ORDER BY "
+        "CASE WHEN designation LIKE '%Director%' THEN 0 "
+        "WHEN designation LIKE '%Dean%' THEN 1 "
+        "WHEN designation LIKE '%HOD%' THEN 2 ELSE 3 END, "
+        "name"
+    )
+
+    try:
+        conn = sqlite3.connect("campus.db")
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        conn.close()
+    except Exception:
+        return None
+
+    if not rows:
+        return None
+
+    # Keep response concise and paragraph-style.
+    if len(rows) == 1:
+        name, designation, email = rows[0]
+        return f"The email for {designation} {name} is {email}."
+
+    parts = []
+    for name, designation, email in rows[:6]:
+        parts.append(f"{designation} {name}: {email}")
+    return "Here are the relevant faculty contacts: " + "; ".join(parts) + "."
+
+
+def _table_to_paragraph(text: str) -> str:
+    """Converts markdown table output into plain paragraph text."""
+    lines = [ln.strip() for ln in text.splitlines()]
+    table_start = -1
+    for i in range(len(lines) - 1):
+        if '|' in lines[i] and re.search(r'^\|?\s*:?-{3,}', lines[i + 1].replace(' ', '')):
+            table_start = i
+            break
+
+    if table_start == -1:
+        return text
+
+    header_line = lines[table_start].strip().strip('|')
+    headers = [h.strip() for h in header_line.split('|') if h.strip()]
+    if not headers:
+        return text
+
+    row_items = []
+    i = table_start + 2
+    while i < len(lines):
+        row = lines[i]
+        if '|' not in row or not row:
+            break
+        cols = [c.strip() for c in row.strip('|').split('|')]
+        if len(cols) < len(headers):
+            break
+        pairs = []
+        for idx, head in enumerate(headers):
+            value = cols[idx].strip()
+            if value:
+                pairs.append(f"{head}: {value}")
+        if pairs:
+            row_items.append('; '.join(pairs))
+        i += 1
+
+    if not row_items:
+        return text.replace('|', ' ')
+
+    prefix = "Here are the details: "
+    paragraph = prefix + "; ".join(row_items) + "."
+
+    before = "\n".join([ln for ln in lines[:table_start] if ln])
+    after = "\n".join([ln for ln in lines[i:] if ln])
+    merged_parts = [part for part in [before, paragraph, after] if part]
+    return "\n\n".join(merged_parts)
+
+
+def _sanitize_response_style(text: str) -> str:
+    """Final style sanitizer to avoid markdown table output in user-facing responses."""
+    cleaned = _table_to_paragraph(text)
+    if '|' in cleaned and re.search(r'^\s*\|', cleaned, re.MULTILINE):
+        cleaned = cleaned.replace('|', ' ')
+    return cleaned
 
 # add this near your other helpers (for example after _generate_sql)
 
@@ -653,6 +903,11 @@ def _run_routing(user_message: str, chat_history: list):
     hardcoded = _try_hardcoded_answer(user_message)
     if hardcoded:
         return ("hardcoded", hardcoded, "Reservation_Norms.pdf")
+
+    # Layer 2.5: Deterministic faculty contact lookup for roles/departments.
+    faculty_contact = _try_faculty_contact_answer(user_message)
+    if faculty_contact:
+        return ("direct", faculty_contact, None)
 
     # Layer 1: Forced PDF routing for policy/reservation keywords
     if _is_forced_pdf(user_message):
@@ -759,7 +1014,10 @@ def chat_endpoint():
     # ── tool call → response_llm ──
     tool_name, query_arg = arg1, arg2
     print(f"⚙️  Executing {tool_name}...")
-    result          = tools_map[tool_name](query_arg)
+    if tool_name in ["Campus_SQL_Data", "SQL"]:
+        result, query_arg = _run_sql_with_repair(user_message, query_arg)
+    else:
+        result = tools_map[tool_name](query_arg)
     final_task_note = _build_final_task_note(tool_name, user_message)
 
     print(f"   📊 Tool result (first 300 chars): {str(result)[:300]}")
@@ -768,8 +1026,8 @@ def chat_endpoint():
         chat_history.append(AIMessage(content=f'{{"tool":"{tool_name}","sql":"{query_arg}"}}'))
         chat_history.append(HumanMessage(
             content=(
-                f"TOOL OUTPUT (SQL result):\n{result}\n\n"
-                f"FINAL TASK: Based ONLY on this data, answer the user's question: '{user_message}'. "
+                f"SQL RESULT:\n{result}\n\n"
+                f"FINAL TASK: Use only this SQL result to answer the user's question: '{user_message}'. "
                 f"{final_task_note}"
             )
         ))
@@ -794,7 +1052,7 @@ def chat_endpoint():
             content=f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: answer '{user_message}'. {final_task_note}"
         ))
 
-    bot_text = final_response.content
+    bot_text = _sanitize_response_style(final_response.content)
     chat_history.append(final_response)
     _trim_history(session_id, chat_history)
 
@@ -905,7 +1163,10 @@ def chat_stream_endpoint():
         # ── tool call → stream response_llm ──
         tool_name, query_arg = arg1, arg2
         print(f"⚙️  Executing {tool_name}...")
-        result          = tools_map[tool_name](query_arg)
+        if tool_name in ["Campus_SQL_Data", "SQL"]:
+            result, query_arg = _run_sql_with_repair(user_message, query_arg)
+        else:
+            result = tools_map[tool_name](query_arg)
         final_task_note = _build_final_task_note(tool_name, user_message)
 
         print(f"   📊 Tool result (first 300 chars): {str(result)[:300]}")
@@ -914,8 +1175,8 @@ def chat_stream_endpoint():
             chat_history.append(AIMessage(content=f'{{"tool":"{tool_name}","sql":"{query_arg}"}}'))
             chat_history.append(HumanMessage(
                 content=(
-                    f"TOOL OUTPUT (SQL result):\n{result}\n\n"
-                    f"FINAL TASK: Based ONLY on this data, answer the user's question: '{user_message}'. "
+                    f"SQL RESULT:\n{result}\n\n"
+                    f"FINAL TASK: Use only this SQL result to answer the user's question: '{user_message}'. "
                     f"{final_task_note}"
                 )
             ))
@@ -945,20 +1206,22 @@ def chat_stream_endpoint():
                 token = chunk.content
                 if token:
                     full_response += token
-                    yield f"data: {json.dumps({'token': token})}\n\n"
         except Exception as e:
             print(f"❌ Streaming error: {e}")
             yield f"data: {json.dumps({'token': '[Error during streaming]'})}\n\n"
 
-        chat_history.append(AIMessage(content=full_response))
+        cleaned_response = _sanitize_response_style(full_response)
+        for word in cleaned_response.split(" "):
+            yield f"data: {json.dumps({'token': word + ' '})}\n\n"
+        chat_history.append(AIMessage(content=cleaned_response))
         _trim_history(session_id, chat_history)
 
         source_file  = None
-        source_match = re.search(r'([A-Za-z0-9_\-]+\.pdf)', full_response)
+        source_match = re.search(r'([A-Za-z0-9_\-]+\.pdf)', cleaned_response)
         if source_match:
             source_file = source_match.group(1)
 
-        done_payload = {"done": True}
+        done_payload = {"done": True, "final_reply": cleaned_response}
         if source_file:
             done_payload["source_file"] = source_file
             done_payload["source_path"] = os.path.join(DOCS_FOLDER, source_file)

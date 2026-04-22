@@ -5,6 +5,51 @@ import os
 # 1. Name of your database file
 DB_NAME = "campus.db"
 
+
+def _build_faculty_aliases(name: str, department: str, designation: str) -> str:
+    """Builds searchable aliases for faculty name, department, and designation."""
+    dept_aliases = {
+        "Administration": ["admin", "administration"],
+        "Academics": ["academic", "academics"],
+        "Infrastructure": ["infra", "infrastructure"],
+        "Civil & Environmental Engineering": ["civil", "civil engineering", "environment", "environmental", "ce"],
+        "Computer & IT": ["computer", "cs", "cse", "it", "information technology"],
+        "Computer Engineering": ["computer", "cs", "cse", "computer engineering"],
+        "Information Technology": ["it", "information technology"],
+        "Electrical Engineering": ["electrical", "ee", "power"],
+        "Electrical Engineering (Diploma)": ["electrical diploma", "diploma electrical", "ee diploma"],
+        "Electronics Engineering (Diploma)": ["electronics diploma", "diploma electronics", "extc diploma"],
+        "Mechanical Engineering": ["mechanical", "mech", "me"],
+        "Production Engineering": ["production", "prod", "pe"],
+        "Structural Engineering": ["structural", "structure", "st"],
+        "Textile Engineering": ["textile", "tx"],
+        "Humanities & Management": ["humanities", "management", "hs"],
+    }
+
+    title_aliases = []
+    d_lower = designation.lower()
+    if "director" in d_lower:
+        title_aliases.extend(["director", "head of institute"])
+    if "dean" in d_lower:
+        title_aliases.extend(["dean", "academic dean", "admin dean", "infrastructure dean"])
+    if "hod" in d_lower:
+        title_aliases.extend(["hod", "head", "head of department"])
+    if "associate professor" in d_lower:
+        title_aliases.append("assoc prof")
+    if "assistant professor" in d_lower:
+        title_aliases.append("asst prof")
+    if "professor" in d_lower:
+        title_aliases.append("prof")
+
+    name_bits = [bit.strip(".") for bit in name.lower().replace("dr.", "").replace("prof.", "").split()]
+    dept_bits = dept_aliases.get(department, [])
+
+    merged = []
+    for token in name_bits + dept_bits + title_aliases:
+        if token and token not in merged:
+            merged.append(token)
+    return ", ".join(merged)
+
 def create_database():
     """Creates the tables for the Smart Campus Chatbot."""
     
@@ -29,7 +74,8 @@ def create_database():
         name TEXT NOT NULL,
         department TEXT,
         designation TEXT,
-        email TEXT
+        email TEXT,
+        aliases TEXT
     )
     ''')
 
@@ -342,7 +388,15 @@ def create_database():
     ('Prof. Kishor Borase', 'Humanities & Management', 'Assistant Professor', 'krborase@hs.vjti.ac.in'),
     ('Dr. Nilima Chaudhary', 'Humanities & Management', 'Assistant Professor', 'nchaudhary@hs.vjti.ac.in'),
 ]
-    cursor.executemany('INSERT INTO faculty (name, department, designation, email) VALUES (?, ?, ?, ?)', faculty_data)
+    faculty_rows = []
+    for name, department, designation, email in faculty_data:
+        aliases = _build_faculty_aliases(name, department, designation)
+        faculty_rows.append((name, department, designation, email, aliases))
+
+    cursor.executemany(
+        'INSERT INTO faculty (name, department, designation, email, aliases) VALUES (?, ?, ?, ?, ?)',
+        faculty_rows,
+    )
     
     # --- 4. Location Data ---
     location_data = [
