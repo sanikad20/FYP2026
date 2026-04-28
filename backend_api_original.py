@@ -271,9 +271,10 @@ CRITICAL RULES:
    - HOD query example: SELECT name, email FROM faculty WHERE designation LIKE '%HOD%' AND department LIKE '%Computer%'
     - Director email example: SELECT name, designation, email FROM faculty WHERE designation LIKE '%Director%' ORDER BY CASE WHEN designation LIKE '%Deputy%' THEN 1 ELSE 0 END, name
     - Dean contact example: SELECT name, designation, email FROM faculty WHERE designation LIKE '%Dean%'
+   - Cutoff comparison: SELECT year, branch, category, percentile FROM cutoffs WHERE branch LIKE '%Computer%' AND category LIKE '%OPENS%' AND year IN (2024, 2025) ORDER BY year ASC
 6. ELIGIBILITY: If user gives a percentile score → SELECT branch, category, percentile FROM cutoffs WHERE percentile <= <score> AND year = 2025
-7. COMPARISON QUERIES: For "compare ... between YEAR1 and YEAR2", return both years in one query using IN (...) and ORDER BY year ASC.
-7. Output ONLY the SQL query. No text before or after. No semicolons unless at the very end."""
+7. COMPARISON QUERIES: For "compare ... between YEAR1 and YEAR2", use IN (year1, year2) and ORDER BY year ASC — ALWAYS include year, branch, and category columns.
+8. Output ONLY the SQL query. No text before or after. No semicolons unless at the very end."""
 
 
 SQL_FIX_SYSTEM = """You repair broken SQLite SELECT queries for this exact schema.
@@ -721,7 +722,7 @@ def _dept_patterns_for_query(msg_lower: str) -> list[str]:
         "Information Technology": [" information technology", " it ", " it department"],
         "Electrical": ["electrical", " ee "],
         "Electronics": ["extc", "entc", "telecom", "electronics"],
-        "Mechanical": ["mechanical", " mech", " me "],
+        "Mechanical": ["mechanical", " mech"],
         "Production": ["production", " prod "],
         "Textile": ["textile"],
         "Humanities": ["humanities", "management", " hs "],
@@ -735,12 +736,92 @@ def _dept_patterns_for_query(msg_lower: str) -> list[str]:
     return patterns
 
 
+def _try_faculty_directory_answer(user_message: str) -> str | None:
+    """Direct faculty directory resolver for listing faculty names and departments."""
+    msg_lower = user_message.lower().strip()
+
+    if any(k in msg_lower for k in ["director", "dean", "hod", "head of department", "email", "mail", "contact"]):
+        return None
+
+    asks_directory = any(
+        k in msg_lower
+        for k in [
+            "all faculty",
+            "faculty of",
+            "faculty in",
+            "faculty from",
+            "faculty members",
+            "names and department",
+            "name and department",
+            "list faculty",
+            "tell me all the faculty",
+            "tell me the faculty",
+            "show faculty",
+        ]
+    )
+    if not asks_directory:
+        return None
+
+    has_explicit_department = any(
+        k in msg_lower
+        for k in [
+            " civil",
+            " computer",
+            " information technology",
+            " electrical",
+            " electronics",
+            " extc",
+            " entc",
+            " telecom",
+            " mechanical",
+            " production",
+            " textile",
+            " humanities",
+            " structural",
+        ]
+    )
+    dept_patterns = _dept_patterns_for_query(msg_lower) if has_explicit_department else []
+    where_sql = ""
+    params: list[str] = []
+    if dept_patterns:
+        dept_clauses = []
+        for pat in dept_patterns:
+            dept_clauses.append("department LIKE ?")
+            params.append(f"%{pat}%")
+        where_sql = " WHERE " + " OR ".join(dept_clauses)
+
+    sql = (
+        "SELECT name, department "
+        "FROM faculty"
+        f"{where_sql} "
+        "ORDER BY department, name"
+    )
+
+    try:
+        conn = sqlite3.connect("campus.db")
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        conn.close()
+    except Exception:
+        return None
+
+    if not rows:
+        return None
+
+    parts = [f"{name} — {department}" for name, department in rows]
+    if len(parts) == 1:
+        return f"The faculty member is {parts[0]}."
+    return "Here are the faculty members and departments: " + "; ".join(parts) + "."
+
+
 def _try_faculty_contact_answer(user_message: str) -> str | None:
     """Direct faculty contact resolver for role/name email queries (LLM bypass)."""
     msg_lower = user_message.lower().strip()
     asks_contact = any(k in msg_lower for k in ["mail", "email", "contact", "email id", "mail id"])
-    is_faculty_intent = any(k in msg_lower for k in ["director", "dean", "hod", "head of department", "prof", "faculty"])
-    if not (asks_contact or is_faculty_intent):
+    is_role_query = any(k in msg_lower for k in ["director", "dean", "hod", "head of department", "prof"])
+    dept_patterns = _dept_patterns_for_query(msg_lower)
+    if not (is_role_query or (asks_contact and dept_patterns)):
         return None
 
     where_clauses = []
@@ -762,8 +843,6 @@ def _try_faculty_contact_answer(user_message: str) -> str | None:
         where_clauses.append("designation LIKE ?")
         params.append("%HOD%")
 
-    # Department alias filters
-    dept_patterns = _dept_patterns_for_query(msg_lower)
     if dept_patterns:
         dept_sub = []
         for pat in dept_patterns:
@@ -974,6 +1053,12 @@ def chat_endpoint():
 
     route_type, arg1, arg2 = _run_routing(user_message, chat_history)
 
+    faculty_directory = _try_faculty_directory_answer(user_message)
+    if faculty_directory:
+        chat_history.append(AIMessage(content=faculty_directory))
+        _trim_history(session_id, chat_history)
+        return jsonify({"reply": faculty_directory})
+
     # ── serve_pdf ──
     if route_type == "serve_pdf":
         pdf_filename, friendly_msg = arg1, arg2
@@ -1117,6 +1202,15 @@ def chat_stream_endpoint():
 
     def generate():
         route_type, arg1, arg2 = _run_routing(user_message, chat_history)
+
+        faculty_directory = _try_faculty_directory_answer(user_message)
+        if faculty_directory:
+            chat_history.append(AIMessage(content=faculty_directory))
+            _trim_history(session_id, chat_history)
+            for word in faculty_directory.split(" "):
+                yield f"data: {json.dumps({'token': word + ' '})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+            return
 
         # ── serve_pdf ──
                 # ── navigation ──
