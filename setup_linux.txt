@@ -1,0 +1,41 @@
+Campus Chat Viz — Linux Setup (No venv)
+
+Step 0 — Install prerequisites
+Ubuntu/Debian:
+  sudo apt update
+  sudo apt install -y git python3 python3-pip nodejs npm
+  # Ollama install:
+  curl -fsSL https://ollama.com/install.sh | sh
+
+Step 1 — Clone the repo
+git clone <YOUR_GIT_URL>
+cd campus-chat-viz
+
+Step 2 — Frontend dependencies
+npm install
+
+Step 3 — Backend Python packages (no venv)
+python3 -m pip install -U pip
+pip3 install flask flask-cors langchain-community langchain-core langchain-text-splitters chromadb pandas
+
+Step 4 — Pull Ollama models
+ollama pull llama3.2:1b
+ollama pull llama3:8b
+ollama pull llama3:70b
+
+Step 5 — Create the database
+python3 setup.py
+
+Optional — Load/refresh DB from CSVs
+Put CSVs in data_uploads/
+python3 "python csv_loader.py"
+
+Step 6 — Build the vector DB from documents
+Put PDFs/TXT in campus_documents/
+python3 vector_setup.py
+
+Step 7 — Start backend
+python3 backend_api_original.py
+
+Step 8 — Start frontend
+npm run dev

@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Overleaf artifacts
+overleaf_report/
+overleaf_report.zip

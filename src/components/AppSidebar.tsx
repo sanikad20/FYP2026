@@ -1,4 +1,4 @@
-import { Bot, BookOpen, MapPin, Users, GraduationCap, Settings, Info } from "lucide-react";
+import { Bot, MapPin, Users, GraduationCap, Settings, Info } from "lucide-react";
 import {
   Sidebar,
   SidebarContent,
@@ -13,9 +13,16 @@ import {
 
 const quickActions = [
   { title: "Campus Map", icon: MapPin },
-  { title: "Faculty Info", icon: Users },
-  { title: "Placements", icon: GraduationCap },
-  { title: "Resources", icon: BookOpen },
+  {
+    title: "Faculty Info",
+    icon: Users,
+    href: "https://vjti.ac.in/electrical-engineering/",
+  },
+  {
+    title: "Placements",
+    icon: GraduationCap,
+    href: "https://vjti.ac.in/previous-reports/",
+  },
 ];
 
 const settingsItems = [
@@ -42,7 +49,14 @@ export function AppSidebar() {
             <SidebarMenu>
               {quickActions.map((item) => (
                 <SidebarMenuItem key={item.title}>
-                  <SidebarMenuButton className="hover:bg-accent/10">
+                  <SidebarMenuButton
+                    className="hover:bg-accent/10"
+                    onClick={() => {
+                      if (item.href) {
+                        window.location.href = item.href;
+                      }
+                    }}
+                  >
                     <item.icon className="h-4 w-4" />
                     {!isCollapsed && <span>{item.title}</span>}
                   </SidebarMenuButton>

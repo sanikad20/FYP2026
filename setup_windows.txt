@@ -1,0 +1,40 @@
+Campus Chat Viz — Windows Setup (No venv)
+
+Step 0 — Install prerequisites
+1) Git: https://git-scm.com/downloads
+2) Python 3.10+ (check "Add Python to PATH" during install)
+3) Node.js LTS (includes npm): https://nodejs.org/
+4) Ollama: https://ollama.com/download
+
+Step 1 — Clone the repo
+git clone <YOUR_GIT_URL>
+cd campus-chat-viz
+
+Step 2 — Frontend dependencies
+npm install
+
+Step 3 — Backend Python packages (no venv)
+python -m pip install -U pip
+pip install flask flask-cors langchain-community langchain-core langchain-text-splitters chromadb pandas
+
+Step 4 — Pull Ollama models
+ollama pull llama3.2:1b
+ollama pull llama3:8b
+ollama pull llama3:70b
+
+Step 5 — Create the database
+python setup.py
+
+Optional — Load/refresh DB from CSVs
+Put CSVs in data_uploads/
+python "python csv_loader.py"
+
+Step 6 — Build the vector DB from documents
+Put PDFs/TXT in campus_documents/
+python vector_setup.py
+
+Step 7 — Start backend
+python backend_api_original.py
+
+Step 8 — Start frontend
+npm run dev

@@ -955,8 +955,28 @@ def _attach_image_urls(directions: dict | None) -> dict | None:
         step["image_url"] = _build_nav_image_url(step.get("image"))
     return directions
 
+
+def _creator_response(user_message: str) -> str | None:
+    """Returns a fixed creator response when asked about who made the chatbot."""
+    msg = user_message.lower()
+    triggers = [
+        "who created", "who made", "who built", "who developed", "who designed",
+        "who authored", "who coded", "creator", "created by", "made by",
+        "developed by", "built by", "author",
+    ]
+    if any(t in msg for t in triggers) and any(k in msg for k in ["you", "this", "chatbot", "bot", "assistant"]):
+        return (
+            "This chatbot was created by Puru Brahmankar and Pratik Bhalekar "
+            "(2026 batch) under the guidance of Dr. G. M. Galshetwar."
+        )
+    return None
+
 # ── Core shared logic ─────────────────────────────────────────────────────────
 def _run_routing(user_message: str, chat_history: list):
+
+    creator_reply = _creator_response(user_message)
+    if creator_reply:
+        return ("direct", creator_reply, None)
     
     # ── Navigation intercept (before all other layers) ──
     nav_intent = detect_navigation_intent(user_message)
