@@ -1,0 +1,21 @@
+# Campus Chat - Python Dependencies
+
+# Web framework
+flask
+flask-cors
+
+# LLM / AI
+langchain-community
+langchain-core
+langchain-text-splitters
+langchain-ollama
+ollama
+chromadb
+
+# Data
+pandas
+
+# Database & Cache
+psycopg2-binary
+python-dotenv
+redis

@@ -23,6 +23,12 @@ dist-ssr
 *.sln
 *.sw?
 
+# Environment variables (contains secrets)
+.env
+
+# Database backups
+campus_backup.db
+
 # Overleaf artifacts
 overleaf_report/
 overleaf_report.zip

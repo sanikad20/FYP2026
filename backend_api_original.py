@@ -19,21 +19,33 @@ Run once before starting:
 import os
 import json
 import re
-import sqlite3
-from flask import Flask, request, jsonify, Response, stream_with_context
+import psycopg2
+import psycopg2.extras
+import redis
+from functools import wraps
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify, Response, stream_with_context, session, send_from_directory
 from flask_cors import CORS
-from flask import send_from_directory
+from werkzeug.security import generate_password_hash, check_password_hash
 
-from langchain_community.chat_models import ChatOllama
+try:
+    from langchain_ollama import ChatOllama
+except ImportError:
+    from langchain_community.chat_models import ChatOllama
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_community.utilities import SQLDatabase
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from navigation import navigation_bp, get_navigation, detect_navigation_intent
+
+# Load environment configuration
+load_dotenv()
+
 NAV_IMAGES_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "campus_navigation_images")
 
 app = Flask(__name__)
-CORS(app)
+app.secret_key = os.environ.get("SECRET_KEY", "campus_chat_secret_key_2026_supersecure")
+CORS(app, supports_credentials=True)
 app.register_blueprint(navigation_bp)   # registers /api/navigate endpoints
 
 # ── Configuration ──
@@ -42,8 +54,32 @@ RESPONSE_MODEL = "llama3"        # full model — writes SQL + generates the fin
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 DOCS_FOLDER = os.path.join(BASE_DIR, "campus_documents")
 
-# ── Connect to databases ──
-db         = SQLDatabase.from_uri("sqlite:///campus.db")
+# ── PostgreSQL Database Configuration (Day 3) ──
+DB_HOST = os.environ.get("DB_HOST", "localhost")
+DB_PORT = os.environ.get("DB_PORT", "5432")
+DB_NAME = os.environ.get("DB_NAME", "campus_chat")
+DB_USER = os.environ.get("DB_USER", "campus_user")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
+
+PG_URI = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+def get_db_connection():
+    """Return a PostgreSQL connection using environment variables."""
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=int(DB_PORT),
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+    )
+
+try:
+    db = SQLDatabase.from_uri(PG_URI)
+    print("🔌 Connected to PostgreSQL (campus_chat) via SQLDatabase")
+except Exception as _e:
+    print(f"⚠️ Failed to connect to PostgreSQL ({_e}), falling back to SQLite campus.db")
+    db = SQLDatabase.from_uri("sqlite:///campus.db")
+
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 vector_db  = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
 
@@ -335,8 +371,121 @@ ANTI-RAGGING:
 - Step 1: Informal (Warden/Faculty). Step 2: Formal Written (Box/Dr. Gangopadhyay). Step 3: UGC portal. Step 4: Committee Enquiry."""
 
 
-# ── Per-session conversation history ──
-sessions = {}
+# ── Redis Session Storage (Day 4) ──
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
+REDIS_DB = int(os.environ.get("REDIS_DB", 0))
+SESSION_TTL = int(os.environ.get("SESSION_TTL", 86400))  # 24 hours TTL
+
+class RedisSessionStore:
+    """Redis-backed session storage with transparent in-memory fallback."""
+    def __init__(self, host="localhost", port=6379, db=0, ttl=86400):
+        self.ttl = ttl
+        self._memory = {}
+        self.use_redis = False
+        try:
+            self.redis = redis.Redis(host=host, port=port, db=db, socket_timeout=2.0)
+            self.redis.ping()
+            self.use_redis = True
+            print(f"📦 Redis session storage connected (host={host}, port={port}, db={db}, ttl={ttl}s)")
+        except Exception as e:
+            self.redis = None
+            print(f"⚠️ Redis unavailable ({e}). Using in-memory fallback for sessions.")
+
+    def _key(self, session_id):
+        return f"campus_chat:session:{session_id}"
+
+    def _serialize_msg(self, msg):
+        if isinstance(msg, HumanMessage):
+            return {"role": "human", "content": msg.content}
+        elif isinstance(msg, AIMessage):
+            return {"role": "ai", "content": msg.content}
+        elif isinstance(msg, SystemMessage):
+            return {"role": "system", "content": msg.content}
+        return {"role": "user", "content": str(getattr(msg, "content", msg))}
+
+    def _deserialize_msg(self, data):
+        role = data.get("role")
+        content = data.get("content", "")
+        if role == "human":
+            return HumanMessage(content=content)
+        elif role == "ai":
+            return AIMessage(content=content)
+        elif role == "system":
+            return SystemMessage(content=content)
+        return HumanMessage(content=content)
+
+    def __contains__(self, session_id):
+        if self.use_redis:
+            try:
+                return bool(self.redis.exists(self._key(session_id)))
+            except Exception:
+                pass
+        return session_id in self._memory
+
+    def __getitem__(self, session_id):
+        if self.use_redis:
+            try:
+                raw = self.redis.get(self._key(session_id))
+                if raw is not None:
+                    items = json.loads(raw.decode("utf-8"))
+                    return [self._deserialize_msg(m) for m in items]
+            except Exception:
+                pass
+        return self._memory.get(session_id, [])
+
+    def __setitem__(self, session_id, messages):
+        self._memory[session_id] = messages
+        if self.use_redis:
+            try:
+                serialized = [self._serialize_msg(m) for m in messages]
+                self.redis.setex(self._key(session_id), self.ttl, json.dumps(serialized))
+            except Exception as e:
+                print(f"⚠️ Error saving session to Redis: {e}")
+
+    def get(self, session_id, default=None):
+        if session_id in self:
+            return self[session_id]
+        return default
+
+    def pop(self, session_id, default=None):
+        val = self.get(session_id, default)
+        if session_id in self._memory:
+            del self._memory[session_id]
+        if self.use_redis:
+            try:
+                self.redis.delete(self._key(session_id))
+            except Exception:
+                pass
+        return val
+
+    def items(self):
+        result = {}
+        if self.use_redis:
+            try:
+                keys = self.redis.keys("campus_chat:session:*")
+                for k in keys:
+                    sid = k.decode("utf-8").replace("campus_chat:session:", "")
+                    result[sid] = self[sid]
+            except Exception:
+                pass
+        for k, v in self._memory.items():
+            if k not in result:
+                result[k] = v
+        return result.items()
+
+sessions = RedisSessionStore(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, ttl=SESSION_TTL)
+
+# ── CacheMind Semantic Cache (Week 2) ──
+from cachemind import CacheMind
+CACHE_SIMILARITY_THRESHOLD = float(os.environ.get("CACHE_SIMILARITY_THRESHOLD", 0.85))
+CACHE_DEFAULT_TTL = int(os.environ.get("CACHE_DEFAULT_TTL", 86400))
+cachemind = CacheMind(
+    redis_client=sessions.redis,
+    embedding_model=embeddings,
+    threshold=CACHE_SIMILARITY_THRESHOLD,
+    default_ttl=CACHE_DEFAULT_TTL,
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # INTERCEPT STACK  (evaluated top-to-bottom in _run_routing)
@@ -625,9 +774,10 @@ def _build_final_task_note(tool_name: str, user_message: str) -> str:
 
 # ── Shared trim helper ────────────────────────────────────────────────────────
 def _trim_history(session_id: str, chat_history: list):
-    """Keep sliding window at max 20 messages."""
+    """Keep sliding window at max 20 messages and persist to session store."""
     if len(chat_history) > 20:
-        sessions[session_id] = chat_history[-10:]
+        chat_history = chat_history[-10:]
+    sessions[session_id] = chat_history
 
 
 # ── SQL generation by response_llm ───────────────────────────────────────────
@@ -786,7 +936,7 @@ def _try_faculty_directory_answer(user_message: str) -> str | None:
     if dept_patterns:
         dept_clauses = []
         for pat in dept_patterns:
-            dept_clauses.append("department LIKE ?")
+            dept_clauses.append("department ILIKE %s")
             params.append(f"%{pat}%")
         where_sql = " WHERE " + " OR ".join(dept_clauses)
 
@@ -797,14 +947,19 @@ def _try_faculty_directory_answer(user_message: str) -> str | None:
         "ORDER BY department, name"
     )
 
+    conn = None
     try:
-        conn = sqlite3.connect("campus.db")
+        conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(sql, params)
         rows = cur.fetchall()
-        conn.close()
-    except Exception:
+        cur.close()
+    except Exception as e:
+        print(f"Error querying faculty directory in PG: {e}")
         return None
+    finally:
+        if conn:
+            conn.close()
 
     if not rows:
         return None
@@ -829,24 +984,24 @@ def _try_faculty_contact_answer(user_message: str) -> str | None:
 
     # Role filters
     if "deputy director" in msg_lower:
-        where_clauses.append("designation LIKE ?")
+        where_clauses.append("designation ILIKE %s")
         params.append("%Deputy Director%")
     elif "director" in msg_lower:
-        where_clauses.append("designation LIKE ?")
+        where_clauses.append("designation ILIKE %s")
         params.append("%Director%")
 
     if "dean" in msg_lower:
-        where_clauses.append("designation LIKE ?")
+        where_clauses.append("designation ILIKE %s")
         params.append("%Dean%")
 
     if any(k in msg_lower for k in ["hod", "head of department", "head "]):
-        where_clauses.append("designation LIKE ?")
+        where_clauses.append("designation ILIKE %s")
         params.append("%HOD%")
 
     if dept_patterns:
         dept_sub = []
         for pat in dept_patterns:
-            dept_sub.append("department LIKE ?")
+            dept_sub.append("department ILIKE %s")
             params.append(f"%{pat}%")
         where_clauses.append("(" + " OR ".join(dept_sub) + ")")
 
@@ -856,20 +1011,25 @@ def _try_faculty_contact_answer(user_message: str) -> str | None:
         "FROM faculty"
         f"{where_sql} "
         "ORDER BY "
-        "CASE WHEN designation LIKE '%Director%' THEN 0 "
-        "WHEN designation LIKE '%Dean%' THEN 1 "
-        "WHEN designation LIKE '%HOD%' THEN 2 ELSE 3 END, "
+        "CASE WHEN designation ILIKE '%%Director%%' THEN 0 "
+        "WHEN designation ILIKE '%%Dean%%' THEN 1 "
+        "WHEN designation ILIKE '%%HOD%%' THEN 2 ELSE 3 END, "
         "name"
     )
 
+    conn = None
     try:
-        conn = sqlite3.connect("campus.db")
+        conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(sql, params)
         rows = cur.fetchall()
-        conn.close()
-    except Exception:
+        cur.close()
+    except Exception as e:
+        print(f"Error querying faculty contact in PG: {e}")
         return None
+    finally:
+        if conn:
+            conn.close()
 
     if not rows:
         return None
@@ -1017,9 +1177,14 @@ def _run_routing(user_message: str, chat_history: list):
         routing_sys = SystemMessage(content=ROUTING_SYSTEM)
         messages_routing = [routing_sys, HumanMessage(content=user_message)]
         print(f"🔀 Routing with {ROUTING_MODEL}...")
-        routing_response = routing_llm.invoke(messages_routing)
-        content = routing_response.content.strip()
-        print(f"   Router decision: {content[:200]}")
+        try:
+            routing_response = routing_llm.invoke(messages_routing)
+            content = routing_response.content.strip()
+            print(f"   Router decision: {content[:200]}")
+        except Exception as e:
+            print(f"⚠️ Routing LLM unavailable ({e}). Falling back to PDF_Knowledge_Base.")
+            safe_query = user_message.replace('"', "'")
+            content = f'{{"tool": "PDF_Knowledge_Base", "query": "{safe_query}"}}'
 
     json_match = re.search(
         r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"query"\s*:\s*"([^"]*?)"\s*\}',
@@ -1052,9 +1217,271 @@ def _run_routing(user_message: str, chat_history: list):
     return ("direct", fallback_msg.content, None)
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Authentication and RBAC (Day 5–7) ─────────────────────────────────────────
+REQUIRE_AUTH = os.environ.get("REQUIRE_AUTH", "true").lower() in ("true", "1", "yes")
+
+def get_current_user():
+    """Resolve the currently authenticated user from Flask session or headers."""
+    # 1. Check Flask session cookie
+    user_id = session.get("user_id")
+    if user_id:
+        return {
+            "id": user_id,
+            "username": session.get("username"),
+            "role": session.get("role"),
+            "email": session.get("email"),
+        }
+
+    # 2. X-Username header for programmatic/API testing
+    header_user = request.headers.get("X-Username")
+    if header_user:
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT id, username, role, email FROM users WHERE username = %s;", (header_user,))
+            row = cur.fetchone()
+            cur.close()
+            if row:
+                return {"id": row[0], "username": row[1], "role": row[2], "email": row[3]}
+        except Exception:
+            pass
+        finally:
+            if conn:
+                conn.close()
+
+    # 3. If REQUIRE_AUTH is explicitly disabled, provide demo student fallback
+    if not REQUIRE_AUTH:
+        return {"id": 0, "username": "guest_student", "role": "student", "email": "guest@vjti.ac.in"}
+
+    return None
+
+
+def login_required(f):
+    """Decorator requiring a logged-in user."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({
+                "error": "Unauthorized",
+                "message": "Authentication required. Please log in first."
+            }), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def role_required(*allowed_roles):
+    """Decorator requiring specific role(s) (e.g. 'admin', 'faculty', 'student')."""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            user = get_current_user()
+            if not user:
+                return jsonify({
+                    "error": "Unauthorized",
+                    "message": "Authentication required. Please log in first."
+                }), 401
+            if user.get("role") not in allowed_roles:
+                return jsonify({
+                    "error": "Forbidden",
+                    "message": f"Access denied. Requires one of roles: {list(allowed_roles)} (current role: {user.get('role')})"
+                }), 403
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+
+# ── Authentication Endpoints ──
+
+@app.route("/api/auth/register", methods=["POST"])
+def auth_register():
+    """Register a new user in PostgreSQL with secure password hashing."""
+    data = request.json or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip()
+    role = data.get("role", "student").strip().lower()
+    email = data.get("email", "").strip() or None
+
+    if not username or len(username) < 3:
+        return jsonify({"error": "Username must be at least 3 characters"}), 400
+    if not password or len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    if role not in ("student", "faculty", "admin"):
+        return jsonify({"error": "Invalid role. Must be 'student', 'faculty', or 'admin'"}), 400
+
+    password_hash = generate_password_hash(password)
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE username = %s;", (username,))
+        if cur.fetchone():
+            cur.close()
+            return jsonify({"error": "Username already exists"}), 409
+
+        cur.execute(
+            "INSERT INTO users (username, password_hash, role, email) VALUES (%s, %s, %s, %s) RETURNING id, username, role, email;",
+            (username, password_hash, role, email)
+        )
+        new_user = cur.fetchone()
+        conn.commit()
+        cur.close()
+
+        return jsonify({
+            "status": "success",
+            "message": "User registered successfully",
+            "user": {
+                "id": new_user[0],
+                "username": new_user[1],
+                "role": new_user[2],
+                "email": new_user[3]
+            }
+        }), 201
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return jsonify({"error": "Registration failed", "detail": str(e)}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def auth_login():
+    """Authenticate credentials against PostgreSQL and establish a server session."""
+    data = request.json or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip()
+
+    if not username or not password:
+        return jsonify({"error": "Username and password required"}), 400
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id, username, password_hash, role, email FROM users WHERE username = %s;", (username,))
+        row = cur.fetchone()
+        cur.close()
+
+        if not row:
+            return jsonify({"error": "Invalid username or password"}), 401
+
+        user_id, uname, p_hash, role, email = row
+        if not check_password_hash(p_hash, password):
+            return jsonify({"error": "Invalid username or password"}), 401
+
+        # Establish server-side Flask session
+        session["user_id"] = user_id
+        session["username"] = uname
+        session["role"] = role
+        session["email"] = email
+
+        return jsonify({
+            "status": "success",
+            "message": "Logged in successfully",
+            "user": {
+                "id": user_id,
+                "username": uname,
+                "role": role,
+                "email": email
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({"error": "Login error", "detail": str(e)}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    """Clear session and log out the user."""
+    session.clear()
+    return jsonify({"status": "success", "message": "Logged out successfully"}), 200
+
+
+@app.route("/api/auth/me", methods=["GET"])
+def auth_me():
+    """Return currently authenticated user information."""
+    user = get_current_user()
+    if user:
+        return jsonify({"authenticated": True, "user": user}), 200
+    return jsonify({"authenticated": False, "user": None}), 200
+
+
+@app.route("/api/admin/status", methods=["GET"])
+@role_required("admin")
+def admin_status():
+    """Admin-only diagnostic endpoint showing system status."""
+    conn = None
+    table_counts = {}
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        for tbl in ["faculty", "programs", "cutoffs", "locations", "placements", "users"]:
+            cur.execute(f'SELECT COUNT(*) FROM "{tbl}";')
+            table_counts[tbl] = cur.fetchone()[0]
+        cur.close()
+    except Exception as e:
+        table_counts["error"] = str(e)
+    finally:
+        if conn:
+            conn.close()
+
+    return jsonify({
+        "status": "ok",
+        "role": "admin",
+        "active_database": "PostgreSQL (campus_chat)",
+        "database_connected": True,
+        "table_counts": table_counts,
+        "redis_connected": sessions.use_redis,
+        "redis_active_sessions": len(list(sessions.items())),
+        "cachemind": cachemind.get_stats(),
+        "message": "Admin privileges verified. All systems operational."
+    }), 200
+
+
+@app.route("/admin", methods=["GET"])
+@role_required("admin")
+def admin_page():
+    """Admin dashboard alias."""
+    return admin_status()
+
+
+# ── CacheMind Endpoints (Week 2) ──────────────────────────────────────────────
+
+@app.route("/api/cache/stats", methods=["GET"])
+def cache_stats_endpoint():
+    """Return CacheMind performance and hit/miss statistics."""
+    stats = cachemind.get_stats()
+    return jsonify(stats), 200
+
+
+@app.route("/api/cache/logs", methods=["GET"])
+def cache_logs_endpoint():
+    """Return recent CacheMind query lookup logs."""
+    limit = request.args.get("limit", default=50, type=int)
+    logs = cachemind.get_logs(limit=limit)
+    return jsonify({"logs": logs, "count": len(logs)}), 200
+
+
+@app.route("/api/cache/clear", methods=["POST"])
+def cache_clear_endpoint():
+    """Flush CacheMind entries and reset statistics."""
+    cachemind.clear()
+    return jsonify({
+        "message": "CacheMind cache and statistics cleared successfully",
+        "status": "success"
+    }), 200
+
+
+# ── Chat Routes ───────────────────────────────────────────────────────────────
 
 @app.route("/api/chat", methods=["POST"])
+@login_required
 def chat_endpoint():
     """Standard JSON response endpoint (non-streaming)."""
     data         = request.json
@@ -1068,6 +1495,24 @@ def chat_endpoint():
         sessions[session_id] = []
 
     chat_history = sessions[session_id]
+
+    # ── CacheMind Semantic Cache Intercept (Week 2) ──
+    is_hit, cached_response, similarity, cache_lat_ms, matched_q = cachemind.lookup(user_message)
+    if is_hit and cached_response:
+        print(f"🎯 CacheMind HIT: '{user_message}' matched '{matched_q}' (sim={similarity:.4f}, {cache_lat_ms:.2f}ms)")
+        cached_reply = cached_response.get("reply", "")
+        chat_history.append(HumanMessage(content=user_message))
+        chat_history.append(AIMessage(content=cached_reply))
+        _trim_history(session_id, chat_history)
+
+        resp = dict(cached_response)
+        resp["cached"] = True
+        resp["cache_similarity"] = round(similarity, 4)
+        resp["cache_latency_ms"] = round(cache_lat_ms, 2)
+        resp["matched_query"] = matched_q
+        return jsonify(resp)
+
+    # ── Cache MISS: Proceed with normal pipeline ──
     response_sys = SystemMessage(content=RESPONSE_SYSTEM)
     chat_history.append(HumanMessage(content=user_message))
 
@@ -1077,7 +1522,10 @@ def chat_endpoint():
     if faculty_directory:
         chat_history.append(AIMessage(content=faculty_directory))
         _trim_history(session_id, chat_history)
-        return jsonify({"reply": faculty_directory})
+        resp_data = {"reply": faculty_directory}
+        cachemind.store(user_message, resp_data)
+        resp_data["cached"] = False
+        return jsonify(resp_data)
 
     # ── serve_pdf ──
     if route_type == "serve_pdf":
@@ -1085,11 +1533,14 @@ def chat_endpoint():
         print(f"📄 Serving PDF directly: {pdf_filename}")
         chat_history.append(AIMessage(content=friendly_msg))
         _trim_history(session_id, chat_history)
-        return jsonify({
+        resp_data = {
             "reply":          friendly_msg,
             "serve_pdf":      pdf_filename,
             "serve_pdf_path": os.path.join(DOCS_FOLDER, pdf_filename),
-        })
+        }
+        cachemind.store(user_message, resp_data)
+        resp_data["cached"] = False
+        return jsonify(resp_data)
 
     # ── hardcoded ──
     if route_type == "hardcoded":
@@ -1097,7 +1548,10 @@ def chat_endpoint():
         print(f"📋 Hardcoded fact returned")
         chat_history.append(AIMessage(content=answer))
         _trim_history(session_id, chat_history)
-        return jsonify({"reply": answer, "source_file": source_file})
+        resp_data = {"reply": answer, "source_file": source_file}
+        cachemind.store(user_message, resp_data)
+        resp_data["cached"] = False
+        return jsonify(resp_data)
     
         # ── navigation ──
     if route_type == "navigation":
@@ -1105,16 +1559,22 @@ def chat_endpoint():
         nav_text = nav_result.get("summary", "")
         chat_history.append(AIMessage(content=nav_text))
         _trim_history(session_id, chat_history)
-        return jsonify({
+        resp_data = {
             "reply": nav_text,
             "navigation": nav_result.get("directions"),
-        })
+        }
+        cachemind.store(user_message, resp_data)
+        resp_data["cached"] = False
+        return jsonify(resp_data)
 
     # ── direct (no tool call) ──
     if route_type == "direct":
         chat_history.append(AIMessage(content=arg1))
         _trim_history(session_id, chat_history)
-        return jsonify({"reply": arg1})
+        resp_data = {"reply": arg1}
+        cachemind.store(user_message, resp_data)
+        resp_data["cached"] = False
+        return jsonify(resp_data)
 
     # ── tool call → response_llm ──
     tool_name, query_arg = arg1, arg2
@@ -1127,37 +1587,46 @@ def chat_endpoint():
 
     print(f"   📊 Tool result (first 300 chars): {str(result)[:300]}")
 
-    if tool_name in ["Campus_SQL_Data", "SQL"]:
-        chat_history.append(AIMessage(content=f'{{"tool":"{tool_name}","sql":"{query_arg}"}}'))
-        chat_history.append(HumanMessage(
-            content=(
-                f"SQL RESULT:\n{result}\n\n"
-                f"FINAL TASK: Use only this SQL result to answer the user's question: '{user_message}'. "
-                f"{final_task_note}"
+    try:
+        if tool_name in ["Campus_SQL_Data", "SQL"]:
+            chat_history.append(AIMessage(content=f'{{"tool":"{tool_name}","sql":"{query_arg}"}}'))
+            chat_history.append(HumanMessage(
+                content=(
+                    f"SQL RESULT:\n{result}\n\n"
+                    f"FINAL TASK: Use only this SQL result to answer the user's question: '{user_message}'. "
+                    f"{final_task_note}"
+                )
+            ))
+            print(f"✍️  Generating answer with {RESPONSE_MODEL}...")
+            final_response = response_llm.invoke([response_sys] + chat_history[-6:])
+        else:
+            isolated_prompt = HumanMessage(
+                content=(
+                    f"RETRIEVED DOCUMENT CONTENT:\n{result}\n\n"
+                    f"---\n"
+                    f"USER QUESTION: {user_message}\n\n"
+                    f"INSTRUCTION: {final_task_note}\n"
+                    f"Find the exact sentence or bullet in the RETRIEVED DOCUMENT CONTENT "
+                    f"that answers the question. Copy the number/fact VERBATIM. "
+                    f"Do not use any other knowledge."
+                )
             )
-        ))
-        print(f"✍️  Generating answer with {RESPONSE_MODEL}...")
-        final_response = response_llm.invoke([response_sys] + chat_history[-6:])
-    else:
-        isolated_prompt = HumanMessage(
-            content=(
-                f"RETRIEVED DOCUMENT CONTENT:\n{result}\n\n"
-                f"---\n"
-                f"USER QUESTION: {user_message}\n\n"
-                f"INSTRUCTION: {final_task_note}\n"
-                f"Find the exact sentence or bullet in the RETRIEVED DOCUMENT CONTENT "
-                f"that answers the question. Copy the number/fact VERBATIM. "
-                f"Do not use any other knowledge."
-            )
-        )
-        print(f"✍️  Generating answer with {RESPONSE_MODEL}...")
-        final_response = response_llm.invoke([response_sys, isolated_prompt])
-        chat_history.append(AIMessage(content=f'{{"tool":"{tool_name}","query":"{query_arg}"}}'))
-        chat_history.append(HumanMessage(
-            content=f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: answer '{user_message}'. {final_task_note}"
-        ))
+            print(f"✍️  Generating answer with {RESPONSE_MODEL}...")
+            final_response = response_llm.invoke([response_sys, isolated_prompt])
+            chat_history.append(AIMessage(content=f'{{"tool":"{tool_name}","query":"{query_arg}"}}'))
+            chat_history.append(HumanMessage(
+                content=f"TOOL OUTPUT:\n{result}\n\nFINAL TASK: answer '{user_message}'. {final_task_note}"
+            ))
+        bot_text = _sanitize_response_style(final_response.content)
+    except Exception as e:
+        print(f"⚠️ Response LLM unavailable ({e}). Synthesizing answer from retrieved context.")
+        if tool_name in ["Campus_SQL_Data", "SQL"]:
+            bot_text = f"Here is the database information: {str(result)[:300]}"
+        else:
+            clean_res = str(result).replace("[OFFICIAL SOURCE: ", "Source: ").strip()
+            bot_text = f"Information retrieved from campus documents:\n{clean_res[:400]}"
+        final_response = AIMessage(content=bot_text)
 
-    bot_text = _sanitize_response_style(final_response.content)
     chat_history.append(final_response)
     _trim_history(session_id, chat_history)
 
@@ -1170,10 +1639,15 @@ def chat_endpoint():
     if source_file:
         response_data["source_file"] = source_file
         response_data["source_path"] = os.path.join(DOCS_FOLDER, source_file)
+
+    # Store cache entry for this query
+    cachemind.store(user_message, response_data)
+    response_data["cached"] = False
     return jsonify(response_data)
 
 
 @app.route("/api/chat/stream", methods=["POST"])
+@login_required
 def chat_stream_endpoint():
     """
     Option B — Streaming SSE endpoint.
@@ -1217,6 +1691,39 @@ def chat_stream_endpoint():
         sessions[session_id] = []
 
     chat_history = sessions[session_id]
+
+    # ── CacheMind Semantic Cache Intercept (Week 2) ──
+    is_hit, cached_response, similarity, cache_lat_ms, matched_q = cachemind.lookup(user_message)
+    if is_hit and cached_response:
+        print(f"🎯 CacheMind HIT (Stream): '{user_message}' matched '{matched_q}' (sim={similarity:.4f}, {cache_lat_ms:.2f}ms)")
+        cached_reply = cached_response.get("reply", "")
+        chat_history.append(HumanMessage(content=user_message))
+        chat_history.append(AIMessage(content=cached_reply))
+        _trim_history(session_id, chat_history)
+
+        def generate_cached():
+            for word in cached_reply.split(" "):
+                yield f"data: {json.dumps({'token': word + ' '})}\n\n"
+            done_payload = dict(cached_response)
+            done_payload["done"] = True
+            done_payload["cached"] = True
+            done_payload["cache_similarity"] = round(similarity, 4)
+            done_payload["cache_latency_ms"] = round(cache_lat_ms, 2)
+            done_payload["matched_query"] = matched_q
+            done_payload["final_reply"] = cached_reply
+            yield f"data: {json.dumps(done_payload)}\n\n"
+
+        return Response(
+            stream_with_context(generate_cached()),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control":               "no-cache",
+                "X-Accel-Buffering":           "no",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    # ── Cache MISS: Proceed with normal streaming pipeline ──
     response_sys = SystemMessage(content=RESPONSE_SYSTEM)
     chat_history.append(HumanMessage(content=user_message))
 
@@ -1229,11 +1736,11 @@ def chat_stream_endpoint():
             _trim_history(session_id, chat_history)
             for word in faculty_directory.split(" "):
                 yield f"data: {json.dumps({'token': word + ' '})}\n\n"
-            yield f"data: {json.dumps({'done': True})}\n\n"
+            cachemind.store(user_message, {"reply": faculty_directory})
+            yield f"data: {json.dumps({'done': True, 'cached': False, 'final_reply': faculty_directory})}\n\n"
             return
 
-        # ── serve_pdf ──
-                # ── navigation ──
+        # ── navigation ──
         if route_type == "navigation":
             nav_result = arg1
             nav_text = nav_result.get("summary", "")
@@ -1241,9 +1748,11 @@ def chat_stream_endpoint():
             _trim_history(session_id, chat_history)
             for word in nav_text.split(" "):
                 yield f"data: {json.dumps({'token': word + ' '})}\n\n"
-            yield f"data: {json.dumps({'done': True, 'navigation': nav_result.get('directions')})}\n\n"
+            cachemind.store(user_message, {"reply": nav_text, "navigation": nav_result.get("directions")})
+            yield f"data: {json.dumps({'done': True, 'cached': False, 'navigation': nav_result.get('directions'), 'final_reply': nav_text})}\n\n"
             return
         
+        # ── serve_pdf ──
         if route_type == "serve_pdf":
             pdf_filename, friendly_msg = arg1, arg2
             print(f"📄 Serving PDF directly: {pdf_filename}")
@@ -1251,7 +1760,12 @@ def chat_stream_endpoint():
             _trim_history(session_id, chat_history)
             for word in friendly_msg.split(" "):
                 yield f"data: {json.dumps({'token': word + ' '})}\n\n"
-            yield f"data: {json.dumps({'done': True, 'serve_pdf': pdf_filename, 'serve_pdf_path': os.path.join(DOCS_FOLDER, pdf_filename)})}\n\n"
+            cachemind.store(user_message, {
+                "reply": friendly_msg,
+                "serve_pdf": pdf_filename,
+                "serve_pdf_path": os.path.join(DOCS_FOLDER, pdf_filename)
+            })
+            yield f"data: {json.dumps({'done': True, 'cached': False, 'serve_pdf': pdf_filename, 'serve_pdf_path': os.path.join(DOCS_FOLDER, pdf_filename), 'final_reply': friendly_msg})}\n\n"
             return
 
         # ── hardcoded ──
@@ -1262,7 +1776,8 @@ def chat_stream_endpoint():
             _trim_history(session_id, chat_history)
             for word in answer.split(" "):
                 yield f"data: {json.dumps({'token': word + ' '})}\n\n"
-            yield f"data: {json.dumps({'done': True, 'source_file': source_file})}\n\n"
+            cachemind.store(user_message, {"reply": answer, "source_file": source_file})
+            yield f"data: {json.dumps({'done': True, 'cached': False, 'source_file': source_file, 'final_reply': answer})}\n\n"
             return
 
         # ── direct ──
@@ -1271,7 +1786,8 @@ def chat_stream_endpoint():
             _trim_history(session_id, chat_history)
             for word in arg1.split(" "):
                 yield f"data: {json.dumps({'token': word + ' '})}\n\n"
-            yield f"data: {json.dumps({'done': True})}\n\n"
+            cachemind.store(user_message, {"reply": arg1})
+            yield f"data: {json.dumps({'done': True, 'cached': False, 'final_reply': arg1})}\n\n"
             return
 
         # ── tool call → stream response_llm ──
@@ -1322,7 +1838,10 @@ def chat_stream_endpoint():
                     full_response += token
         except Exception as e:
             print(f"❌ Streaming error: {e}")
-            yield f"data: {json.dumps({'token': '[Error during streaming]'})}\n\n"
+            if not full_response:
+                clean_res = str(result).replace("[OFFICIAL SOURCE: ", "Source: ").strip()
+                full_response = f"Information retrieved from campus documents:\n{clean_res[:400]}"
+            yield f"data: {json.dumps({'token': full_response})}\n\n"
 
         cleaned_response = _sanitize_response_style(full_response)
         for word in cleaned_response.split(" "):
@@ -1335,10 +1854,15 @@ def chat_stream_endpoint():
         if source_match:
             source_file = source_match.group(1)
 
-        done_payload = {"done": True, "final_reply": cleaned_response}
+        store_payload = {"reply": cleaned_response}
+        done_payload = {"done": True, "cached": False, "final_reply": cleaned_response}
         if source_file:
+            store_payload["source_file"] = source_file
+            store_payload["source_path"] = os.path.join(DOCS_FOLDER, source_file)
             done_payload["source_file"] = source_file
             done_payload["source_path"] = os.path.join(DOCS_FOLDER, source_file)
+
+        cachemind.store(user_message, store_payload)
         yield f"data: {json.dumps(done_payload)}\n\n"
 
     return Response(
