@@ -15,7 +15,7 @@ import json
 import sqlite3
 import psycopg2
 import redis
-from werkzeug.security import check_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -202,21 +202,26 @@ def test_day5_7_auth_and_rbac():
     })
     record_test("Register Student", r_student.status_code == 201, f"{r_student.get_json()}")
 
-    r_faculty = client.post("/api/auth/register", json={
-        "username": "test_faculty",
-        "password": "password123",
-        "role": "faculty",
-        "email": "faculty@vjti.ac.in"
-    })
-    record_test("Register Faculty", r_faculty.status_code == 201, f"{r_faculty.get_json()}")
-
-    r_admin = client.post("/api/auth/register", json={
+    r_privileged = client.post("/api/auth/register", json={
         "username": "test_admin",
         "password": "adminpassword123",
         "role": "admin",
         "email": "admin@vjti.ac.in"
     })
-    record_test("Register Admin", r_admin.status_code == 201, f"{r_admin.get_json()}")
+    record_test("Self-registration cannot grant admin role (403)", r_privileged.status_code == 403)
+
+    pg_conn = get_db_connection()
+    pg_cur = pg_conn.cursor()
+    pg_cur.executemany(
+        "INSERT INTO users (username, password_hash, role, email) VALUES (%s, %s, %s, %s);",
+        [
+            ("test_faculty", generate_password_hash("password123"), "faculty", "faculty@vjti.ac.in"),
+            ("test_admin", generate_password_hash("adminpassword123"), "admin", "admin@vjti.ac.in"),
+        ],
+    )
+    pg_conn.commit()
+    pg_cur.close()
+    pg_conn.close()
 
     # 2. Duplicate registration rejected
     r_dup = client.post("/api/auth/register", json={

@@ -61,7 +61,16 @@ DB_NAME = os.environ.get("DB_NAME", "campus_chat")
 DB_USER = os.environ.get("DB_USER", "campus_user")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 
-PG_URI = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+from sqlalchemy.engine import URL
+
+PG_URI = URL.create(
+    drivername="postgresql+psycopg2",
+    username=DB_USER,
+    password=DB_PASSWORD,
+    host=DB_HOST,
+    port=int(DB_PORT),
+    database=DB_NAME,
+)
 
 def get_db_connection():
     """Return a PostgreSQL connection using environment variables."""
@@ -1309,6 +1318,8 @@ def auth_register():
         return jsonify({"error": "Password must be at least 6 characters"}), 400
     if role not in ("student", "faculty", "admin"):
         return jsonify({"error": "Invalid role. Must be 'student', 'faculty', or 'admin'"}), 400
+    if role != "student":
+        return jsonify({"error": "Self-registration is only available for student accounts"}), 403
 
     password_hash = generate_password_hash(password)
 

@@ -9,13 +9,16 @@ langchain-community
 langchain-core
 langchain-text-splitters
 langchain-ollama
+langchain-huggingface
 ollama
 chromadb
+sentence-transformers
 
 # Data
 pandas
 
 # Database & Cache
 psycopg2-binary
+sqlalchemy
 python-dotenv
 redis

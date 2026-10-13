@@ -1,7 +1,10 @@
-import { useState, useEffect, useRef } from "react";
-import { Bot, Moon, Sun, FileText, Download, ExternalLink } from "lucide-react";
+import { useState, useEffect, useRef, type FormEvent } from "react";
+import { Bot, LogOut, Moon, Sun, FileText, Download, ExternalLink } from "lucide-react";
 import { useTheme } from "@/components/ThemeProvider";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import MessageBubble from "@/components/chat/MessageBubble";
 import TypingIndicator from "@/components/chat/TypingIndicator";
 import MapPreviewCard from "@/components/chat/MapPreviewCard";
@@ -10,7 +13,17 @@ import PlacementChart from "@/components/chat/PlacementChart";
 import ChatInput from "@/components/chat/ChatInput";
 import { AppSidebar } from "@/components/AppSidebar";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
-import { sendMessage, checkHealth, NavigationData } from "@/lib/chatApi";
+import {
+  ApiError,
+  checkHealth,
+  getCurrentUser,
+  login,
+  logout,
+  register,
+  sendMessage,
+  type AuthenticatedUser,
+  type NavigationData,
+} from "@/lib/chatApi";
 import { toast } from "sonner";
 
 interface Message {
@@ -158,6 +171,14 @@ const Index = () => {
   const { theme, setTheme } = useTheme();
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
+  const [currentUser, setCurrentUser] = useState<AuthenticatedUser | null>(null);
+  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [isRegistering, setIsRegistering] = useState(false);
+  const [isCreatingAccount, setIsCreatingAccount] = useState(false);
+  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [messages, setMessages] = useState<Message[]>([
     {
       id: "1",
@@ -171,6 +192,12 @@ const Index = () => {
 
   useEffect(() => {
     checkHealth().then(setBackendOnline);
+    getCurrentUser()
+      .then(setCurrentUser)
+      .catch((error: unknown) => {
+        toast.error(error instanceof Error ? error.message : "Could not check your login status.");
+      })
+      .finally(() => setIsCheckingAuth(false));
   }, []);
 
   useEffect(() => {
@@ -229,21 +256,163 @@ const Index = () => {
           },
         ]);
       }
-    } catch {
+    } catch (error) {
       setIsTyping(false);
-      toast.error("Could not reach the backend. Make sure the Python server is running.");
+      if (error instanceof ApiError && error.status === 401) {
+        setCurrentUser(null);
+        toast.error("Your login session expired. Please sign in again.");
+        return;
+      }
+      const errorMessage = error instanceof Error
+        ? error.message
+        : "Could not reach the backend. Make sure the Python server is running.";
+      toast.error(errorMessage);
       setMessages((prev) => [
         ...prev,
         {
           id: (Date.now() + 1).toString(),
           type: "text",
-          content:
-            "I couldn't connect to the backend server. Please make sure the Python server is running (python backend_api.py).",
+          content: errorMessage,
           isUser: false,
         },
       ]);
     }
   };
+
+  const handleLogin = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setIsLoggingIn(true);
+    try {
+      const user = await login(username.trim(), password);
+      setCurrentUser(user);
+      setPassword("");
+      toast.success(`Welcome, ${user.username}.`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Login failed.");
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleRegister = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setIsCreatingAccount(true);
+    try {
+      const normalizedUsername = username.trim();
+      await register(normalizedUsername, password, email.trim() || undefined);
+      const user = await login(normalizedUsername, password);
+      setCurrentUser(user);
+      setPassword("");
+      toast.success("Your account is ready.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not create your account.");
+    } finally {
+      setIsCreatingAccount(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await logout();
+      setCurrentUser(null);
+      setPassword("");
+      toast.success("You have been signed out.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not sign out.");
+    }
+  };
+
+  if (isCheckingAuth) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-transparent p-4">
+        <p className="text-sm text-muted-foreground">Checking your login...</p>
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-transparent p-4">
+        <Card className="w-full max-w-md">
+          <CardHeader className="items-center text-center">
+            <div className="mb-2 flex h-12 w-12 items-center justify-center rounded-xl bg-primary/10">
+              <Bot className="h-6 w-6 text-primary" />
+            </div>
+            <CardTitle>Smart Campus Assistant</CardTitle>
+            <CardDescription>
+              {isRegistering
+                ? "Create a student account to start chatting."
+                : "Sign in to start chatting with your campus assistant."}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <form
+              className="space-y-4"
+              onSubmit={isRegistering ? handleRegister : handleLogin}
+            >
+              <div className="space-y-2">
+                <Label htmlFor="username">Username</Label>
+                <Input
+                  id="username"
+                  autoComplete="username"
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  minLength={3}
+                  required
+                  disabled={isLoggingIn || isCreatingAccount}
+                />
+              </div>
+              {isRegistering && (
+                <div className="space-y-2">
+                  <Label htmlFor="email">Email (optional)</Label>
+                  <Input
+                    id="email"
+                    type="email"
+                    autoComplete="email"
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    disabled={isCreatingAccount}
+                  />
+                </div>
+              )}
+              <div className="space-y-2">
+                <Label htmlFor="password">Password</Label>
+                <Input
+                  id="password"
+                  type="password"
+                  autoComplete={isRegistering ? "new-password" : "current-password"}
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  minLength={isRegistering ? 6 : undefined}
+                  required
+                  disabled={isLoggingIn || isCreatingAccount}
+                />
+              </div>
+              <Button className="w-full" type="submit" disabled={isLoggingIn || isCreatingAccount}>
+                {isRegistering
+                  ? isCreatingAccount ? "Creating account..." : "Create account"
+                  : isLoggingIn ? "Signing in..." : "Sign in"}
+              </Button>
+            </form>
+            <p className="mt-4 text-center text-sm text-muted-foreground">
+              {isRegistering ? "Already have an account?" : "New here?"}{" "}
+              <button
+                type="button"
+                className="font-medium text-primary underline-offset-4 hover:underline"
+                onClick={() => {
+                  setIsRegistering((value) => !value);
+                  setPassword("");
+                }}
+                disabled={isLoggingIn || isCreatingAccount}
+              >
+                {isRegistering ? "Sign in" : "Create an account"}
+              </button>
+            </p>
+          </CardContent>
+        </Card>
+      </main>
+    );
+  }
 
   return (
     <SidebarProvider defaultOpen={true}>
@@ -270,16 +439,31 @@ const Index = () => {
                   )}
                 </div>
               </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-                className="h-9 w-9 rounded-lg"
-              >
-                <Sun className="h-4 w-4 rotate-0 scale-100 transition-all dark:-rotate-90 dark:scale-0" />
-                <Moon className="absolute h-4 w-4 rotate-90 scale-0 transition-all dark:rotate-0 dark:scale-100" />
-                <span className="sr-only">Toggle theme</span>
-              </Button>
+              <div className="flex items-center gap-2">
+                <span className="hidden text-sm text-muted-foreground sm:inline">
+                  {currentUser.username}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={handleLogout}
+                  className="h-9 w-9 rounded-lg"
+                  title="Sign out"
+                  aria-label="Sign out"
+                >
+                  <LogOut className="h-4 w-4" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+                  className="h-9 w-9 rounded-lg"
+                >
+                  <Sun className="h-4 w-4 rotate-0 scale-100 transition-all dark:-rotate-90 dark:scale-0" />
+                  <Moon className="absolute h-4 w-4 rotate-90 scale-0 transition-all dark:rotate-0 dark:scale-100" />
+                  <span className="sr-only">Toggle theme</span>
+                </Button>
+              </div>
             </div>
           </header>
 
