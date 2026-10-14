@@ -106,6 +106,27 @@ export interface NavigationData {
   floors_involved: number[];
 }
 
+export interface ChatLocation {
+  id: string;
+  name: string;
+  department?: string;
+  description?: string;
+  latitude?: number;
+  longitude?: number;
+}
+
+export interface CampusMapAction {
+  location_id?: string;
+  start_id?: string;
+  end_id?: string;
+  query?: string;
+}
+
+export interface ExternalLink {
+  label: string;
+  url: string;
+}
+
 export interface ChatResponse {
   reply: string;
   source_file?: string;
@@ -114,6 +135,23 @@ export interface ChatResponse {
   serve_pdf_path?: string;
   // Navigation payload — present when backend returns route steps
   navigation?: NavigationData;
+  location?: ChatLocation;
+  map_action?: CampusMapAction;
+  external_link?: ExternalLink;
+  route?: {
+    start: string;
+    end: string;
+    distance_m: number;
+    route: string[];
+    path_coordinates?: [number, number][];
+    estimated_walking_minutes?: number;
+    steps?: Array<{
+      from: string;
+      to: string;
+      instruction: string;
+      distance_m: number;
+    }>;
+  };
 }
 
 export async function sendMessage(message: string): Promise<ChatResponse> {

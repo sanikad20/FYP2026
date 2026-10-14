@@ -4,9 +4,13 @@ interface MessageBubbleProps {
   message: string;
   isUser: boolean;
   timestamp?: string;
+  externalLink?: {
+    label: string;
+    url: string;
+  };
 }
 
-const MessageBubble = ({ message, isUser, timestamp }: MessageBubbleProps) => {
+const MessageBubble = ({ message, isUser, timestamp, externalLink }: MessageBubbleProps) => {
   return (
     <div className={cn("flex w-full animate-bubble-in", isUser ? "justify-end" : "justify-start")}>
       <div
@@ -18,6 +22,16 @@ const MessageBubble = ({ message, isUser, timestamp }: MessageBubbleProps) => {
         )}
       >
         <p className="text-sm md:text-[0.95rem] leading-7">{message}</p>
+        {externalLink && (
+          <a
+            href={externalLink.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="mt-2 inline-block text-sm font-medium text-primary underline underline-offset-4"
+          >
+            {externalLink.label}
+          </a>
+        )}
         {timestamp && <p className="mt-1 text-xs opacity-60">{timestamp}</p>}
       </div>
     </div>

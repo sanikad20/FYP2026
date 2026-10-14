@@ -19,6 +19,7 @@ Run once before starting:
 import os
 import json
 import re
+import networkx as nx
 import psycopg2
 import psycopg2.extras
 import redis
@@ -53,6 +54,246 @@ ROUTING_MODEL  = "llama3.2:1b"   # fast small model — ONLY picks which tool to
 RESPONSE_MODEL = "llama3"        # full model — writes SQL + generates the final answer
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 DOCS_FOLDER = os.path.join(BASE_DIR, "campus_documents")
+
+CAMPUS_LOCATIONS = [
+    {
+        "id": "vjti_campus",
+        "name": "VJTI Campus (mapped site reference)",
+        "department": "Veermata Jijabhai Technological Institute",
+        "latitude": 19.0221717,
+        "longitude": 72.8562039,
+        "description": "OpenStreetMap campus feature reference point; this is not a building entrance.",
+        "aliases": ["vjti", "campus", "college", "veermata jijabhai technological institute"],
+        "floor": None,
+        "room": None,
+        "source": "https://www.openstreetmap.org/way/112781811",
+        "verified": True,
+    },
+]
+
+CAMPUS_LOCATION_DIRECTORY = [
+    {
+        "id": "directory_main_gate",
+        "name": "Main Gate",
+        "aliases": ["entrance", "main entrance", "vjti gate", "security gate"],
+    },
+    {
+        "id": "directory_main_building",
+        "name": "Main Building",
+        "aliases": ["administrative office", "admin office", "principal office"],
+    },
+    {
+        "id": "directory_it_department",
+        "name": "IT Department",
+        "aliases": ["it dept", "information technology", "computer department", "cs department"],
+    },
+    {
+        "id": "directory_library",
+        "name": "Central Library",
+        "aliases": ["library", "reading hall"],
+    },
+    {
+        "id": "directory_mechanical",
+        "name": "Mechanical Department",
+        "aliases": ["mechanical dept", "mech", "workshop"],
+    },
+    {
+        "id": "directory_extc",
+        "name": "EXTC Department",
+        "aliases": ["extc", "electronics and telecommunication", "electronics and telecom"],
+    },
+    {
+        "id": "directory_canteen",
+        "name": "Canteen",
+        "aliases": ["cafeteria"],
+    },
+    {
+        "id": "directory_tpo",
+        "name": "Training and Placement Office (TPO)",
+        "aliases": ["tpo", "placement office", "training and placement office"],
+    },
+    {
+        "id": "directory_room_101",
+        "name": "Room 101",
+        "aliases": ["101"],
+    },
+    {
+        "id": "directory_room_205",
+        "name": "Room 205",
+        "aliases": ["205"],
+    },
+    {
+        "id": "directory_computer_lab",
+        "name": "Computer Centre Lab",
+        "aliases": ["cc lab", "computer center", "computer centre"],
+    },
+    {
+        "id": "directory_seminar_hall",
+        "name": "Seminar Hall",
+        "aliases": ["it seminar hall"],
+    },
+]
+
+CAMPUS_BOUNDARY = [
+    [19.0196137, 72.8548499],
+    [19.0191208, 72.8556099],
+    [19.0190582, 72.8557599],
+    [19.0190658, 72.8558591],
+    [19.0191249, 72.8559372],
+    [19.0195900, 72.8561804],
+    [19.0213633, 72.8566256],
+    [19.0229802, 72.8569773],
+    [19.0245647, 72.8570359],
+    [19.0243109, 72.8560785],
+    [19.0205996, 72.8552594],
+    [19.0196137, 72.8548499],
+]
+CAMPUS_BOUNDARY_SOURCE = "https://www.openstreetmap.org/way/112781811"
+
+def _get_campus_locations():
+    """Return the OSM campus reference and administrator-verified database pins."""
+    locations = list(CAMPUS_LOCATIONS)
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS campus_map_locations (
+                        id BIGSERIAL PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        department TEXT,
+                        description TEXT,
+                        aliases TEXT[] NOT NULL DEFAULT '{}',
+                        latitude DOUBLE PRECISION NOT NULL,
+                        longitude DOUBLE PRECISION NOT NULL,
+                        source TEXT NOT NULL,
+                        verified_by TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cursor.execute("""
+                    SELECT id, name, department, description, aliases, latitude, longitude, source
+                    FROM campus_map_locations
+                    ORDER BY name
+                """)
+                for row in cursor.fetchall():
+                    locations.append({
+                        "id": f"location_{row[0]}",
+                        "name": row[1],
+                        "department": row[2],
+                        "description": row[3],
+                        "aliases": row[4] or [],
+                        "latitude": row[5],
+                        "longitude": row[6],
+                        "source": row[7],
+                        "verified": True,
+                        "floor": None,
+                        "room": None,
+                    })
+    except psycopg2.Error as error:
+        app.logger.exception("Could not load verified campus map locations from PostgreSQL")
+        raise RuntimeError("Campus map locations could not be loaded from PostgreSQL.") from error
+    return locations
+
+
+def _get_campus_location_suggestions(verified_locations):
+    """Return known campus place names that still need verified map pins."""
+    verified_terms = {
+        _normalize_lookup_text(term)
+        for location in verified_locations
+        for term in [location["name"], *(location.get("aliases") or [])]
+    }
+    return [
+        {
+            **suggestion,
+            "description": "Known campus destination; its map pin needs verification.",
+            "verified": False,
+        }
+        for suggestion in CAMPUS_LOCATION_DIRECTORY
+        if not any(
+            _normalize_lookup_text(term) in verified_terms
+            for term in [suggestion["name"], *suggestion["aliases"]]
+        )
+    ]
+
+
+CAMPUS_LOCATION_MAP = {location["id"]: location for location in CAMPUS_LOCATIONS}
+
+PATHWAYS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "campus_pathways.json")
+
+
+def _haversine_distance_m(start, end):
+    """Calculate the ground distance between (latitude, longitude) points."""
+    from math import asin, cos, radians, sin, sqrt
+
+    lat1, lon1 = map(radians, start)
+    lat2, lon2 = map(radians, end)
+    lat_delta = lat2 - lat1
+    lon_delta = lon2 - lon1
+    value = sin(lat_delta / 2) ** 2 + cos(lat1) * cos(lat2) * sin(lon_delta / 2) ** 2
+    return 6_371_000 * 2 * asin(sqrt(value))
+
+
+def _load_pathway_graph():
+    """Load manually verified pedestrian paths; no synthetic links are added."""
+    with open(PATHWAYS_FILE, encoding="utf-8") as pathways_file:
+        data = json.load(pathways_file)
+
+    graph = nx.Graph()
+    access_points = data.get("location_access", {})
+    for node in data.get("nodes", []):
+        node_id = node["id"]
+        latitude = float(node["latitude"])
+        longitude = float(node["longitude"])
+        if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+            raise ValueError(f"Invalid coordinates for campus pathway node {node_id!r}.")
+        graph.add_node(node_id, coordinates=[latitude, longitude])
+
+    for edge in data.get("edges", []):
+        start_id = edge["from"]
+        end_id = edge["to"]
+        if start_id not in graph or end_id not in graph:
+            raise ValueError(f"Campus pathway edge references an unknown node: {edge!r}.")
+        coordinates = edge.get("coordinates", [])
+        if len(coordinates) < 2:
+            raise ValueError(f"Campus pathway edge needs at least two coordinates: {edge!r}.")
+        normalized_coordinates = [
+            [float(point[0]), float(point[1])]
+            for point in coordinates
+        ]
+        for latitude, longitude in normalized_coordinates:
+            if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+                raise ValueError(f"Invalid pathway geometry coordinates: {edge!r}.")
+        start_coordinates = graph.nodes[start_id]["coordinates"]
+        end_coordinates = graph.nodes[end_id]["coordinates"]
+        if (
+            _haversine_distance_m(start_coordinates, normalized_coordinates[0]) > 2
+            or _haversine_distance_m(end_coordinates, normalized_coordinates[-1]) > 2
+        ):
+            raise ValueError(f"Campus pathway geometry must meet its endpoint nodes: {edge!r}.")
+        distance = sum(
+            _haversine_distance_m(first, second)
+            for first, second in zip(normalized_coordinates, normalized_coordinates[1:])
+        )
+        if distance <= 0:
+            raise ValueError(f"Campus pathway edge has no measurable length: {edge!r}.")
+        graph.add_edge(
+            start_id,
+            end_id,
+            distance=distance,
+            coordinates=normalized_coordinates,
+            from_node=start_id,
+            to_node=end_id,
+        )
+
+    for location_id, node_id in access_points.items():
+        if location_id not in CAMPUS_LOCATION_MAP or node_id not in graph:
+            raise ValueError(
+                f"Campus pathway access point {location_id!r} references an unknown location or node."
+            )
+    return graph, access_points
+
+
+CAMPUS_GRAPH, CAMPUS_LOCATION_ACCESS = _load_pathway_graph()
 
 # ── PostgreSQL Database Configuration (Day 3) ──
 DB_HOST = os.environ.get("DB_HOST", "localhost")
@@ -1489,7 +1730,453 @@ def cache_clear_endpoint():
     }), 200
 
 
-# ── Chat Routes ───────────────────────────────────────────────────────────────
+# ── Campus Locations & Navigation ───────────────────────────────────────────
+
+def _normalize_lookup_text(value: str) -> str:
+    """Normalize campus lookup text for matching."""
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+def _find_campus_location(query: str):
+    """Resolve a campus building or department from a user message."""
+    normalized = _normalize_lookup_text(query)
+    if not normalized:
+        return None
+
+    matches = []
+    for location in _get_campus_locations():
+        aliases = [
+            location["name"],
+            location["department"] or "",
+            *(location.get("aliases") or []),
+        ]
+        for alias in aliases:
+            normalized_alias = _normalize_lookup_text(alias)
+            if normalized_alias and re.search(
+                rf"(?<![a-z0-9]){re.escape(normalized_alias)}(?![a-z0-9])",
+                normalized,
+            ):
+                matches.append((len(normalized_alias), location))
+    return max(matches, key=lambda match: match[0])[1] if matches else None
+
+
+def _find_campus_location_suggestion(query: str):
+    """Resolve a known place name that does not yet have a verified map pin."""
+    normalized = _normalize_lookup_text(query)
+    if not normalized:
+        return None
+
+    matches = []
+    verified_locations = _get_campus_locations()
+    for location in _get_campus_location_suggestions(verified_locations):
+        for alias in [location["name"], *location["aliases"]]:
+            normalized_alias = _normalize_lookup_text(alias)
+            if normalized_alias and re.search(
+                rf"(?<![a-z0-9]){re.escape(normalized_alias)}(?![a-z0-9])",
+                normalized,
+            ):
+                matches.append((len(normalized_alias), location))
+    return max(matches, key=lambda match: match[0])[1] if matches else None
+
+
+def _calculate_campus_route(start_id: str, end_id: str):
+    """Return a shortest walking path made only from verified pathway geometry."""
+    try:
+        current_locations = _get_campus_locations()
+    except RuntimeError:
+        app.logger.exception("Cannot resolve route endpoints because campus locations are unavailable")
+        return None
+    CAMPUS_LOCATION_MAP.clear()
+    CAMPUS_LOCATION_MAP.update({location["id"]: location for location in current_locations})
+
+    start_node = CAMPUS_LOCATION_ACCESS.get(start_id)
+    end_node = CAMPUS_LOCATION_ACCESS.get(end_id)
+    if not start_node or not end_node:
+        return None
+
+    try:
+        path = nx.shortest_path(CAMPUS_GRAPH, source=start_node, target=end_node, weight="distance")
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return None
+
+    total_distance = 0
+    path_coordinates = []
+    for idx in range(len(path) - 1):
+        current = path[idx]
+        nxt = path[idx + 1]
+        edge = CAMPUS_GRAPH[current][nxt]
+        distance = edge["distance"]
+        total_distance += distance
+        edge_coordinates = edge["coordinates"]
+        if current != edge["from_node"]:
+            edge_coordinates = list(reversed(edge_coordinates))
+        if path_coordinates and path_coordinates[-1] == edge_coordinates[0]:
+            path_coordinates.extend(edge_coordinates[1:])
+        else:
+            path_coordinates.extend(edge_coordinates)
+
+    if not path_coordinates:
+        path_coordinates = [CAMPUS_GRAPH.nodes[path[0]]["coordinates"]]
+
+    return {
+        "start": start_id,
+        "end": end_id,
+        "distance_m": int(total_distance),
+        "route": path,
+        "path_coordinates": path_coordinates,
+        "estimated_walking_minutes": round(total_distance / 84, 1),
+        "available": True,
+    }
+
+
+def _campus_location_response(user_message: str):
+    """Handle campus map requests before the generic RAG/LLM pipeline."""
+    message = user_message.strip()
+    if not message:
+        return None
+
+    normalized_message = _normalize_lookup_text(message)
+    is_location_query = bool(re.search(
+        r"\b(where is|where's|show me|find|navigate|directions?|route|how do i reach|take me to)\b",
+        message,
+        re.IGNORECASE,
+    ))
+    if not is_location_query:
+        return None
+
+    route_match = re.search(r"\bfrom\s+(.+?)\s+to\s+(.+)$", message, re.IGNORECASE)
+    route_order = "from_to"
+    if not route_match:
+        route_match = re.search(r"\bto\s+(.+?)\s+from\s+(.+)$", message, re.IGNORECASE)
+        route_order = "to_from"
+
+    start_loc = end_loc = None
+    start_suggestion = end_suggestion = None
+    if route_match:
+        first_query = route_match.group(1).rstrip(" ?.!," )
+        second_query = route_match.group(2).rstrip(" ?.!," )
+        first = _find_campus_location(first_query)
+        second = _find_campus_location(second_query)
+        first_suggestion = _find_campus_location_suggestion(first_query)
+        second_suggestion = _find_campus_location_suggestion(second_query)
+        if route_order == "from_to":
+            start_loc, end_loc = first, second
+            start_suggestion, end_suggestion = first_suggestion, second_suggestion
+        else:
+            end_loc, start_loc = first, second
+            end_suggestion, start_suggestion = first_suggestion, second_suggestion
+    else:
+        end_loc = _find_campus_location(message)
+        end_suggestion = _find_campus_location_suggestion(message)
+
+    if route_match and (not start_loc or not end_loc):
+        if start_suggestion or end_suggestion:
+            missing_names = [
+                suggestion["name"]
+                for suggestion in (start_suggestion, end_suggestion)
+                if suggestion
+            ]
+            return {
+                "reply": (
+                    f"I recognized {', '.join(missing_names)}, but "
+                    f"{'its' if len(missing_names) == 1 else 'their'} map pin "
+                    "has not been verified. An administrator must add a verified building entrance "
+                    "before I can calculate walking directions."
+                ),
+                "map_action": {"query": message},
+            }
+        return {
+            "reply": "I couldn't identify both campus locations. Please use known building names, such as Library or Canteen.",
+            "map_action": {"query": message},
+        }
+
+    if start_loc and end_loc:
+        route = _calculate_campus_route(start_loc["id"], end_loc["id"])
+        if route:
+            return {
+                "reply": (
+                    f"The mapped walking route from {start_loc['name']} to {end_loc['name']} is "
+                    f"{route['distance_m']} metres (about {route['estimated_walking_minutes']} minutes)."
+                ),
+                "map_action": {"start_id": start_loc["id"], "end_id": end_loc["id"]},
+            }
+        return {
+            "reply": (
+                f"I found {start_loc['name']} and {end_loc['name']}, but a verified walking route is unavailable. "
+                "The map will not draw a straight-line substitute."
+            ),
+            "map_action": {"start_id": start_loc["id"], "end_id": end_loc["id"]},
+        }
+
+    if end_loc:
+        return {
+            "reply": (
+                f"I found {end_loc['name']}. The campus map is open; please select a starting point "
+                "to request directions."
+            ),
+            "map_action": {"location_id": end_loc["id"]},
+        }
+
+    if "tpo" in normalized_message or "training and placement office" in normalized_message:
+        return {
+            "reply": (
+                "The Training and Placement Office is a VJTI campus office, but its specific building entrance "
+                "or room is not verified in the map data, so I won't guess its physical pin. I opened the map "
+                "and searched for TPO. The official page may have current office contact details."
+            ),
+            "map_action": {"query": "TPO"},
+            "external_link": {
+                "label": "VJTI Training and Placement Office",
+                "url": PLACEMENTS_URL,
+            },
+        }
+
+    if end_suggestion:
+        return {
+            "reply": (
+                f"{end_suggestion['name']} is in the campus place directory, but its map pin has not been verified. "
+                "I opened the map search; an administrator must add a verified entrance before it can be shown "
+                "or used for directions."
+            ),
+            "map_action": {"query": end_suggestion["name"]},
+        }
+
+    if any(term in normalized_message for term in ("library", "canteen", "gate", "department", "office")):
+        return {
+            "reply": "I couldn't match that place to a campus location in the available map data.",
+            "map_action": {"query": message},
+        }
+
+    return None
+
+
+PLACEMENTS_URL = "https://vjti.ac.in/training-and-placement-office/"
+
+
+def _placements_response(user_message: str):
+    """Return verified placement rows from PostgreSQL or an explicit official link."""
+    normalized = _normalize_lookup_text(user_message)
+    placement_query = any(term in normalized for term in ("placement", "placements", "tpo"))
+    if not placement_query:
+        return None
+
+    explicit_open = bool(re.search(r"\b(open|visit|go to|launch)\b", user_message, re.IGNORECASE)) or bool(
+        re.search(r"\b(website|webpage|official site|placement site)\b", user_message, re.IGNORECASE)
+    )
+    physical_tpo_location = bool(re.search(r"\b(where is|where's|location of)\b", user_message, re.IGNORECASE)) and (
+        "tpo" in normalized or "training and placement office" in normalized
+    )
+    if physical_tpo_location and not explicit_open:
+        return None
+
+    asks_for_data = (
+        normalized in {"placement", "placements"}
+        or any(term in normalized for term in (
+            "statistic", "statistics", "report", "reports", "data", "package",
+            "how many", "rate", "offers", "companies", "salary",
+        ))
+    )
+    if not explicit_open and not asks_for_data:
+        return None
+
+    if explicit_open:
+        return {
+            "reply": "Here is VJTI's official Training and Placement Office webpage.",
+            "external_link": {"label": "VJTI Training and Placement Office", "url": PLACEMENTS_URL},
+        }
+
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT year, company, branch, package_lpa, students_placed "
+                    "FROM placements ORDER BY year DESC NULLS LAST, company LIMIT 20"
+                )
+                rows = cursor.fetchall()
+    except Exception as error:
+        print(f"⚠️ Could not query placement records from PostgreSQL: {error}")
+        rows = []
+
+    if rows:
+        details = [
+            f"{year or 'Year not listed'} — {company or 'Company not listed'}; "
+            f"{branch or 'Branch not listed'}; package {package if package is not None else 'not listed'} LPA; "
+            f"{count if count is not None else 'student count not listed'} students placed"
+            for year, company, branch, package, count in rows
+        ]
+        return {
+            "reply": "Placement records found in the campus database:\n" + "\n".join(details),
+            "external_link": {"label": "Official VJTI placement page", "url": PLACEMENTS_URL},
+        }
+
+    return {
+        "reply": (
+            "I couldn't find verified placement statistics in the campus PostgreSQL database. "
+            "Please check VJTI's official Training and Placement Office page."
+        ),
+        "external_link": {"label": "VJTI Training and Placement Office", "url": PLACEMENTS_URL},
+    }
+
+
+@app.route("/api/campus/locations", methods=["GET", "POST"])
+@login_required
+def campus_locations_endpoint():
+    """List verified campus map pins or save one as an administrator."""
+    if request.method == "GET":
+        try:
+            locations = _get_campus_locations()
+        except RuntimeError as error:
+            return jsonify({"error": str(error)}), 503
+        CAMPUS_LOCATION_MAP.clear()
+        CAMPUS_LOCATION_MAP.update({location["id"]: location for location in locations})
+        return jsonify({
+            "locations": locations,
+            "count": len(locations),
+            "suggestions": _get_campus_location_suggestions(locations),
+            "boundary": CAMPUS_BOUNDARY,
+            "boundary_source": CAMPUS_BOUNDARY_SOURCE,
+        })
+
+    user = get_current_user()
+    if not user or user.get("role") != "admin":
+        return jsonify({"error": "Only administrators can save verified campus locations."}), 403
+
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    description = str(data.get("description", "")).strip()
+    source = str(data.get("source", "")).strip()
+    department = str(data.get("department", "")).strip() or None
+    aliases = data.get("aliases", [])
+    verified = data.get("verified") is True
+    try:
+        latitude = float(data.get("latitude"))
+        longitude = float(data.get("longitude"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Select a valid point on the campus map."}), 400
+
+    if not name or not source or not verified:
+        return jsonify({
+            "error": "A name, verification source, and explicit verification confirmation are required."
+        }), 400
+    if len(name) > 200 or len(description) > 1000 or len(source) > 500:
+        return jsonify({"error": "Location fields exceed the permitted length."}), 400
+    if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+        return jsonify({"error": "Coordinates are outside valid latitude/longitude ranges."}), 400
+    if not isinstance(aliases, list) or any(not isinstance(alias, str) for alias in aliases):
+        return jsonify({"error": "Aliases must be a list of text values."}), 400
+    clean_aliases = [alias.strip()[:100] for alias in aliases if alias.strip()]
+
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS campus_map_locations (
+                        id BIGSERIAL PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        department TEXT,
+                        description TEXT,
+                        aliases TEXT[] NOT NULL DEFAULT '{}',
+                        latitude DOUBLE PRECISION NOT NULL,
+                        longitude DOUBLE PRECISION NOT NULL,
+                        source TEXT NOT NULL,
+                        verified_by TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cursor.execute("""
+                    INSERT INTO campus_map_locations
+                        (name, department, description, aliases, latitude, longitude, source, verified_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (
+                    name, department, description or None, clean_aliases,
+                    latitude, longitude, source, user["username"],
+                ))
+                location_id = cursor.fetchone()[0]
+    except psycopg2.Error as error:
+        app.logger.exception("Could not save verified campus location")
+        return jsonify({"error": "The campus location could not be saved to PostgreSQL."}), 503
+
+    location = {
+        "id": f"location_{location_id}",
+        "name": name,
+        "department": department,
+        "description": description,
+        "aliases": clean_aliases,
+        "latitude": latitude,
+        "longitude": longitude,
+        "source": source,
+        "verified": True,
+        "floor": None,
+        "room": None,
+    }
+    CAMPUS_LOCATION_MAP[location["id"]] = location
+    return jsonify({"location": location}), 201
+
+
+@app.route("/api/campus/locations/search", methods=["GET"])
+@login_required
+def campus_location_search_endpoint():
+    """Search campus locations by building name, department, room, or alias."""
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({"locations": []}), 400
+
+    matches = []
+    normalized = _normalize_lookup_text(query)
+    try:
+        locations = _get_campus_locations()
+    except RuntimeError as error:
+        return jsonify({"error": str(error)}), 503
+    for location in locations:
+        haystack = " ".join([
+            location["name"],
+            location.get("department") or "",
+            location.get("description") or "",
+            *(location.get("aliases") or []),
+            location.get("room") or "",
+        ]).lower()
+        if normalized in haystack:
+            matches.append(location)
+    return jsonify({"locations": matches, "count": len(matches)})
+
+
+@app.route("/api/campus/locations/<location_id>", methods=["GET"])
+@login_required
+def campus_location_detail_endpoint(location_id):
+    """Return a single campus location record."""
+    location = CAMPUS_LOCATION_MAP.get(location_id)
+    if not location:
+        return jsonify({"error": "Location not found", "message": f"No campus location matches '{location_id}'."}), 404
+    return jsonify({"location": location})
+
+
+@app.route("/api/campus/route", methods=["GET"])
+@login_required
+def campus_route_endpoint():
+    """Return the shortest valid walking route between two campus locations."""
+    start_id = request.args.get("start", "").strip()
+    end_id = request.args.get("end", "").strip()
+
+    if not start_id or not end_id:
+        return jsonify({"error": "Both start and end are required", "message": "Use ?start=<id>&end=<id> to request a route."}), 400
+
+    start_location = CAMPUS_LOCATION_MAP.get(start_id)
+    end_location = CAMPUS_LOCATION_MAP.get(end_id)
+    if not start_location or not end_location:
+        return jsonify({"error": "Unknown route request", "message": "One or both campus locations were not found."}), 404
+
+    route = _calculate_campus_route(start_id, end_id)
+    if not route:
+        return jsonify({
+            "error": "Route unavailable",
+            "message": "A verified walking route is not available for this campus pair yet.",
+            "start": start_id,
+            "end": end_id,
+        }), 404
+
+    return jsonify(route)
+
 
 @app.route("/api/chat", methods=["POST"])
 @login_required
@@ -1506,6 +2193,17 @@ def chat_endpoint():
         sessions[session_id] = []
 
     chat_history = sessions[session_id]
+
+    direct_response = _placements_response(user_message)
+    if direct_response is None:
+        direct_response = _campus_location_response(user_message)
+    if direct_response is not None:
+        chat_history.append(HumanMessage(content=user_message))
+        chat_history.append(AIMessage(content=direct_response["reply"]))
+        _trim_history(session_id, chat_history)
+        cachemind.store(user_message, direct_response)
+        direct_response["cached"] = False
+        return jsonify(direct_response)
 
     # ── CacheMind Semantic Cache Intercept (Week 2) ──
     is_hit, cached_response, similarity, cache_lat_ms, matched_q = cachemind.lookup(user_message)

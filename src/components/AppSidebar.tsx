@@ -11,6 +11,10 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 
+interface AppSidebarProps {
+  onCampusMapToggle?: () => void;
+}
+
 const quickActions = [
   { title: "Campus Map", icon: MapPin },
   {
@@ -21,7 +25,7 @@ const quickActions = [
   {
     title: "Placements",
     icon: GraduationCap,
-    href: "https://vjti.ac.in/previous-reports/",
+    href: "https://vjti.ac.in/training-and-placement-office/",
   },
 ];
 
@@ -30,7 +34,7 @@ const settingsItems = [
   { title: "Settings", icon: Settings },
 ];
 
-export function AppSidebar() {
+export function AppSidebar({ onCampusMapToggle }: AppSidebarProps) {
   const { state } = useSidebar();
   const isCollapsed = state === "collapsed";
 
@@ -49,17 +53,28 @@ export function AppSidebar() {
             <SidebarMenu>
               {quickActions.map((item) => (
                 <SidebarMenuItem key={item.title}>
-                  <SidebarMenuButton
-                    className="hover:bg-accent/10"
-                    onClick={() => {
-                      if (item.href) {
-                        window.location.href = item.href;
-                      }
-                    }}
-                  >
-                    <item.icon className="h-4 w-4" />
-                    {!isCollapsed && <span>{item.title}</span>}
-                  </SidebarMenuButton>
+                  {item.title === "Placements" && item.href ? (
+                    <SidebarMenuButton asChild className="hover:bg-accent/10">
+                      <a href={item.href} target="_blank" rel="noopener noreferrer">
+                        <item.icon className="h-4 w-4" />
+                        {!isCollapsed && <span>{item.title}</span>}
+                      </a>
+                    </SidebarMenuButton>
+                  ) : (
+                    <SidebarMenuButton
+                      className="hover:bg-accent/10"
+                      onClick={() => {
+                        if (item.title === "Campus Map" && onCampusMapToggle) {
+                          onCampusMapToggle();
+                        } else if (item.href) {
+                          window.location.href = item.href;
+                        }
+                      }}
+                    >
+                      <item.icon className="h-4 w-4" />
+                      {!isCollapsed && <span>{item.title}</span>}
+                    </SidebarMenuButton>
+                  )}
                 </SidebarMenuItem>
               ))}
             </SidebarMenu>

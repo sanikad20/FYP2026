@@ -11,6 +11,7 @@ import MapPreviewCard from "@/components/chat/MapPreviewCard";
 import FacultyCarousel from "@/components/chat/FacultyCarousel";
 import PlacementChart from "@/components/chat/PlacementChart";
 import ChatInput from "@/components/chat/ChatInput";
+import CampusMapPanel from "@/components/campus/CampusMapPanel";
 import { AppSidebar } from "@/components/AppSidebar";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import {
@@ -21,6 +22,8 @@ import {
   logout,
   register,
   sendMessage,
+  type CampusMapAction,
+  type ExternalLink,
   type AuthenticatedUser,
   type NavigationData,
 } from "@/lib/chatApi";
@@ -35,6 +38,7 @@ interface Message {
   servePdf?: string;
   servePdfPath?: string;
   navigation?: NavigationData;
+  externalLink?: ExternalLink;
 }
 
 const buildPdfUrl = (filename: string, filepath?: string) => {
@@ -189,6 +193,8 @@ const Index = () => {
     },
   ]);
   const [isTyping, setIsTyping] = useState(false);
+  const [isMapOpen, setIsMapOpen] = useState(false);
+  const [mapAction, setMapAction] = useState<CampusMapAction | null>(null);
 
   useEffect(() => {
     checkHealth().then(setBackendOnline);
@@ -220,6 +226,11 @@ const Index = () => {
     try {
       const response = await sendMessage(content);
       setIsTyping(false);
+
+      if (response.map_action) {
+        setMapAction(response.map_action);
+        setIsMapOpen(true);
+      }
 
       if (response.serve_pdf) {
         setMessages((prev) => [
@@ -253,6 +264,7 @@ const Index = () => {
             content: response.reply,
             isUser: false,
             sourceFile: response.source_file,
+            externalLink: response.external_link,
           },
         ]);
       }
@@ -417,7 +429,12 @@ const Index = () => {
   return (
     <SidebarProvider defaultOpen={true}>
       <div className="flex min-h-screen w-full bg-transparent">
-        <AppSidebar />
+        <AppSidebar
+          onCampusMapToggle={() => {
+            setMapAction(null);
+            setIsMapOpen((value) => !value);
+          }}
+        />
 
         <div className="flex flex-1 flex-col">
           <header className="sticky top-0 z-10 border-b border-border/70 bg-card/60 backdrop-blur-md">
@@ -469,6 +486,21 @@ const Index = () => {
 
           <div className="flex-1 overflow-y-auto">
             <div className="mx-auto max-w-4xl p-4 md:p-6">
+              {isMapOpen && (
+                <div className="mb-4">
+                  <CampusMapPanel
+                    onClose={() => {
+                      setMapAction(null);
+                      setIsMapOpen(false);
+                    }}
+                    isAdmin={currentUser.role === "admin"}
+                    focusLocationId={mapAction?.location_id}
+                    focusQuery={mapAction?.query}
+                    routeStartId={mapAction?.start_id}
+                    routeEndId={mapAction?.end_id}
+                  />
+                </div>
+              )}
               <div className="rounded-2xl border border-border/60 bg-card/55 p-4 shadow-card backdrop-blur-sm md:p-6">
                 <div className="space-y-4">
                   {messages.map((message) => {
@@ -478,6 +510,7 @@ const Index = () => {
                           key={message.id}
                           message={message.content || ""}
                           isUser={message.isUser}
+                          externalLink={message.externalLink}
                         />
                       );
                     }

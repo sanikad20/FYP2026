@@ -1,0 +1,6 @@
+{
+  "instructions": "Add only field-verified or OpenStreetMap-sourced walking nodes, path geometries, and location access mappings. Each node has id, latitude, and longitude. Each edge has from, to, and coordinates: an ordered array of [latitude, longitude] points that traces the real walkable segment from the from node to the to node. location_access maps a saved campus location id (for example location_12) to a pathway node id at its verified entrance. No route is available until this graph is populated.",
+  "nodes": [],
+  "edges": [],
+  "location_access": {}
+}
