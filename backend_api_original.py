@@ -20,6 +20,8 @@ import os
 from dotenv import load_dotenv
 
 load_dotenv()
+os.environ["USE_TF"] = "0"
+os.environ["USE_TORCH"] = "1"
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
@@ -731,15 +733,22 @@ class RedisSessionStore:
 
 sessions = RedisSessionStore(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, ttl=SESSION_TTL)
 
-# ── CacheMind Semantic Cache (Week 2) ──
+# ── CacheMind Semantic Cache & Intelligence Layer (Week 2 & Week 3) ──
 from cachemind import CacheMind
 CACHE_SIMILARITY_THRESHOLD = float(os.environ.get("CACHE_SIMILARITY_THRESHOLD", 0.85))
 CACHE_DEFAULT_TTL = int(os.environ.get("CACHE_DEFAULT_TTL", 86400))
+CACHE_MAX_ENTRIES = int(os.environ.get("CACHE_MAX_ENTRIES", 1000))
+CACHE_WEIGHT_RECENCY = float(os.environ.get("CACHE_WEIGHT_RECENCY", 0.5))
+CACHE_WEIGHT_FREQUENCY = float(os.environ.get("CACHE_WEIGHT_FREQUENCY", 0.5))
+
 cachemind = CacheMind(
     redis_client=sessions.redis,
     embedding_model=embeddings,
     threshold=CACHE_SIMILARITY_THRESHOLD,
     default_ttl=CACHE_DEFAULT_TTL,
+    max_entries=CACHE_MAX_ENTRIES,
+    weight_recency=CACHE_WEIGHT_RECENCY,
+    weight_frequency=CACHE_WEIGHT_FREQUENCY,
 )
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1732,6 +1741,68 @@ def cache_clear_endpoint():
     return jsonify({
         "message": "CacheMind cache and statistics cleared successfully",
         "status": "success"
+    }), 200
+
+
+# ── Week 3 Intelligence Layer Endpoints ──
+
+@app.route("/api/cache/intelligence", methods=["GET"])
+def cache_intelligence_endpoint():
+    """Return CacheMind Week 3 Intelligence configuration and policy details."""
+    stats = cachemind.get_stats()
+    return jsonify({
+        "status": "ok",
+        "eviction_policy": stats.get("eviction_policy"),
+        "max_capacity": stats.get("max_capacity"),
+        "cached_entries": stats.get("cached_entries_count"),
+        "total_evictions": stats.get("total_evictions"),
+        "total_ttl_extensions": stats.get("total_ttl_extensions"),
+        "total_expired_purges": stats.get("total_expired_purges"),
+        "weights": {
+            "recency": stats.get("weight_recency"),
+            "frequency": stats.get("weight_frequency"),
+        },
+        "ttl_config": {
+            "default_ttl_seconds": stats.get("default_ttl_seconds"),
+            "max_ttl_seconds": stats.get("max_ttl_seconds"),
+            "extension_factor": cachemind.ttl_extension_factor,
+        }
+    }), 200
+
+
+@app.route("/api/cache/purge-expired", methods=["POST"])
+def cache_purge_expired_endpoint():
+    """Trigger active sweep and eviction of expired entries."""
+    purged = cachemind.purge_expired()
+    return jsonify({
+        "status": "ok",
+        "purged_count": purged,
+        "active_entries": cachemind.get_stats().get("cached_entries_count")
+    }), 200
+
+
+@app.route("/api/cache/simulate-comparison", methods=["POST"])
+def cache_simulate_comparison_endpoint():
+    """Run simulated comparison of CacheMind Scored Eviction vs Plain LRU vs Plain LFU."""
+    data = request.json or {}
+    sample_queries = data.get("queries", [
+        "where is the library",
+        "hostel fee structure",
+        "where is the library",
+        "who is the director",
+        "where is the library",
+        "placement statistics 2024",
+        "what is the cutoff for computer engineering",
+        "where is the library",
+        "who is the hod of electrical",
+        "academic calendar overview",
+        "where is the library"
+    ])
+    capacity = int(data.get("capacity", 3))
+    results = CacheMind.simulate_policy_comparison(sample_queries, capacity=capacity)
+    return jsonify({
+        "status": "ok",
+        "simulation": results
     }), 200
 
 

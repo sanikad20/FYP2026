@@ -32,3 +32,8 @@ campus_backup.db
 # Overleaf artifacts
 overleaf_report/
 overleaf_report.zip
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
