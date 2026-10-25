@@ -17,6 +17,12 @@ Run once before starting:
 """
 
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import json
 import re
 import networkx as nx
@@ -24,7 +30,6 @@ import psycopg2
 import psycopg2.extras
 import redis
 from functools import wraps
-from dotenv import load_dotenv
 from flask import Flask, request, jsonify, Response, stream_with_context, session, send_from_directory
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
