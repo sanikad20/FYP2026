@@ -22,3 +22,11 @@ psycopg2-binary
 sqlalchemy
 python-dotenv
 redis
+
+# Week 4 - Document Ingestion, Watchdog & Sync
+pymupdf
+watchdog
+apscheduler
+beautifulsoup4
+requests
+networkx

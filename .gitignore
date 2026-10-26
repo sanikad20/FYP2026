@@ -37,3 +37,15 @@ overleaf_report.zip
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Week 4 Document Ingestion folders
+documents/incoming/*
+!documents/incoming/.gitkeep
+documents/processing/*
+!documents/processing/.gitkeep
+documents/processed/*
+!documents/processed/.gitkeep
+documents/failed/*
+!documents/failed/.gitkeep
+documents/quarantine/*
+!documents/quarantine/.gitkeep

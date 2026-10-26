@@ -96,3 +96,67 @@ The full-project ESLint command is `npm run lint`; it may also report pre-existi
 5. Add verified pathway nodes, edges, and location access mappings to `campus_pathways.json` before expecting walking directions. Each edge's ordered coordinate list must follow an actual walkable path.
 
 The chatbot recognizes text and voice requests such as “Where is TPO?”, “Show me the library,” and “How do I reach the canteen from the library?”. If a destination or pathway is not verified, it explains the limitation rather than inventing a pin or route.
+
+## Week 4: Document Ingestion, Predictive Prefetching & Administration
+
+Week 4 introduces an automated enterprise RAG document lifecycle, predictive prefetching intelligence, website crawling, and role-based administration:
+
+### 1. Key Capabilities
+- **Automated PDF Ingestion Pipeline** (`document_ingestion.py`):
+  - Ingestion via PyMuPDF (`fitz`), text chunking (`RecursiveCharacterTextSplitter`), and embedding generation (`all-MiniLM-L6-v2`).
+  - Automatic deduplication via SHA-256 file hashing.
+  - Storage in ChromaDB vector database and relational metadata in PostgreSQL (`documents`, `document_versions`, `document_chunks`, `document_ingestion_jobs`).
+- **Dedicated Watchdog Worker** (`run_watchdog.py`, `watchdog_service.py`):
+  - Monitors `documents/incoming/` using Python Watchdog.
+  - Implements size-stability and file-lock verification before processing.
+  - Automatically moves files through `documents/processing/` to `documents/processed/` (or `documents/failed/`).
+  - Runs as a dedicated background worker to prevent duplicate threads in Flask web workers.
+- **Predictive Prefetch Engine** (`prefetch_engine.py`):
+  - Markov chain model trained on user query transitions (`query_transitions`).
+  - Predicts likely follow-up queries when transition probability exceeds confidence threshold (`PREFETCH_CONFIDENCE_THRESHOLD=0.40`).
+  - Pre-warms CacheMind semantic cache in the background using the secure RAG pipeline (`pdf_search()`).
+  - Enforces per-minute prefetch budget (`PREFETCH_BUDGET_PER_MINUTE=20`) and prevents session or role privilege bleed.
+- **VJTI Website Periodic Sync** (`sync_service.py`):
+  - Periodically checks configured official VJTI web pages (notices, circulars, syllabi, admissions) using APScheduler.
+  - Strict security with domain allowlist (`vjti.ac.in`), SSRF prevention, and rate-limiting.
+  - Detects new/updated PDFs by SHA-256 and triggers ingestion.
+- **Admin Dashboard API** (`admin_api.py`):
+  - RBAC protected endpoints (`/api/admin/*`) requiring `admin` role.
+  - Endpoints for overview metrics, document listing/approval/archiving, prefetch telemetry, and manual sync triggers.
+- **Database Migrations** (`migrate_week4.py`, `migrations_week4.sql`):
+  - 9 relational tables: `documents`, `document_versions`, `document_chunks`, `document_ingestion_jobs`, `document_sync_sources`, `document_sync_history`, `document_audit_logs`, `query_transitions`, `prefetch_metrics`.
+
+### 2. Week 4 Environment Variables
+Configure the following in `.env`:
+```ini
+# Predictive Prefetching
+PREFETCH_CONFIDENCE_THRESHOLD=0.40
+PREFETCH_TTL=86400
+PREFETCH_BUDGET_PER_MINUTE=20
+
+# Website Synchronization
+SYNC_INTERVAL_HOURS=6
+SYNC_ENABLED=true
+
+# Upload Limits
+MAX_PDF_SIZE_MB=25
+```
+
+### 3. Running Week 4 Services
+
+**Run the Database Migration:**
+```powershell
+python migrate_week4.py
+```
+
+**Run the Dedicated Ingestion Watchdog:**
+```powershell
+python run_watchdog.py
+```
+Drop any PDF into `documents/incoming/` to test automatic ingestion.
+
+**Run the Comprehensive Week 4 Test Suite:**
+```powershell
+python test_week4.py
+```
+

@@ -17,6 +17,18 @@ Run once before starting:
 """
 
 import os
+import sys
+
+# Windows UTF-8 stdout/stderr fix for console emojis
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -354,8 +366,21 @@ def pdf_search(query):
     print(f"   🔍 Searching PDF Database for: '{query}'...")
     raw_docs = vector_db.similarity_search(query, k=15)
 
+    # Filter: ONLY approved documents and active versions (excludes pending/rejected/superseded)
+    approved_docs = []
+    for d in raw_docs:
+        meta = d.metadata or {}
+        approval = meta.get("approval_status")
+        is_active = meta.get("is_active")
+        # Legacy chunks without approval_status are treated as approved
+        if approval is not None and approval != "approved":
+            continue
+        if is_active is not None and is_active is False:
+            continue
+        approved_docs.append(d)
+
     retrieved_sources = list(set([
-        os.path.basename(d.metadata.get('source', 'Unknown')) for d in raw_docs
+        os.path.basename(d.metadata.get('source', 'Unknown')) for d in approved_docs
     ]))
     print(f"   📂 Retrieved Chunks from: {retrieved_sources}")
 
@@ -374,7 +399,7 @@ def pdf_search(query):
     other_docs       = []
     q_upper          = query.upper()
 
-    for d in raw_docs:
+    for d in approved_docs:
         content     = d.page_content.upper()
         source_name = os.path.basename(d.metadata.get('source', '')).upper()
         is_priority = False
@@ -402,7 +427,14 @@ def pdf_search(query):
     context_list = []
     for d in final_docs:
         source = os.path.basename(d.metadata.get('source', 'Unknown File'))
-        context_list.append(f"[OFFICIAL SOURCE: {source}]\n{d.page_content}")
+        doc_title = d.metadata.get('title')
+        source_url = d.metadata.get('source_url')
+        header = f"[OFFICIAL SOURCE: {source}]"
+        if doc_title:
+            header += f"\n[DOCUMENT TITLE: {doc_title}]"
+        if source_url:
+            header += f"\n[SOURCE URL: {source_url}]"
+        context_list.append(f"{header}\n{d.page_content}")
 
     return "\n\n---\n\n".join(context_list)
 
@@ -750,6 +782,72 @@ cachemind = CacheMind(
     weight_recency=CACHE_WEIGHT_RECENCY,
     weight_frequency=CACHE_WEIGHT_FREQUENCY,
 )
+
+# ── Week 4: Document Lifecycle, Ingestion, Sync & Predictive Prefetching ──────
+# role_required is defined later in this file; admin_api uses lazy injection
+# so we import the modules here, instantiate services, and call init_admin_api()
+# inside an app factory hook to avoid circular references.
+
+from document_manager import DocumentManager
+from document_ingestion import DocumentIngestionPipeline
+from prefetch_engine import PredictivePrefetchEngine
+from sync_service import VJTIWebsiteSyncService
+from admin_api import admin_bp, init_admin_api
+
+# DocumentManager – approval lifecycle + ChromaDB metadata sync
+document_manager_w4 = DocumentManager(
+    db_connection_factory=get_db_connection,
+    vector_db=vector_db,
+    prefetch_engine=None,   # back-patched after prefetch engine is ready
+)
+
+# Ingestion pipeline – PDF validation, extraction, chunking, ChromaDB indexing
+ingestion_pipeline_w4 = DocumentIngestionPipeline(
+    vector_db=vector_db,
+    embeddings=embeddings,
+    db_connection_factory=get_db_connection,
+)
+
+
+def _rag_answer_generator(query: str, auth_role: str = "student") -> dict:
+    """
+    Secure RAG answer generator for the prefetch engine.
+    Reuses the same approved-document-only pdf_search pipeline.
+    Only PDF knowledge base queries are prefetched (no SQL/live session data).
+    """
+    try:
+        result = pdf_search(query)
+        if not result or "No matching records" in result:
+            return {}
+        return {"reply": result, "prefetch_source": "pdf_rag"}
+    except Exception as _e:
+        print(f"[Prefetch RAG] Error for '{query}': {_e}")
+        return {}
+
+
+# PredictivePrefetchEngine – Markov chain + background ThreadPoolExecutor
+prefetch_engine_w4 = PredictivePrefetchEngine(
+    cachemind_instance=cachemind,
+    db_connection_factory=get_db_connection,
+    rag_answer_generator=_rag_answer_generator,
+    confidence_threshold=float(os.environ.get("PREFETCH_CONFIDENCE_THRESHOLD", 0.40)),
+    prefetch_ttl=int(os.environ.get("PREFETCH_TTL", 86400)),
+    max_concurrent=int(os.environ.get("PREFETCH_MAX_CONCURRENT", 2)),
+    budget_per_minute=int(os.environ.get("PREFETCH_BUDGET_PER_MINUTE", 20)),
+    enabled=True,
+)
+
+# Back-patch DocumentManager so approval/archive triggers cache invalidation
+document_manager_w4.prefetch_engine = prefetch_engine_w4
+
+# Website sync service – crawls approved VJTI pages for new PDFs
+sync_service_w4 = VJTIWebsiteSyncService(
+    db_connection_factory=get_db_connection,
+    ingestion_pipeline=ingestion_pipeline_w4,
+)
+
+print("[Week4] Week 4 services initialized (DocumentManager, IngestionPipeline, PrefetchEngine, SyncService).")
+print(f"[Week4] Prefetch engine: enabled={prefetch_engine_w4.enabled}, threshold={prefetch_engine_w4.confidence_threshold}")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # INTERCEPT STACK  (evaluated top-to-bottom in _run_routing)
@@ -1556,6 +1654,18 @@ def role_required(*allowed_roles):
     return decorator
 
 
+# ── Week 4: Wire admin API and register blueprint ─────────────────────────────
+# Done here so role_required is already defined above.
+init_admin_api(
+    doc_mgr=document_manager_w4,
+    pipeline=ingestion_pipeline_w4,
+    sync_svc=sync_service_w4,
+    prefetch_eng=prefetch_engine_w4,
+    role_dec=role_required,
+)
+app.register_blueprint(admin_bp)
+print("[Week4] Admin blueprint registered (/api/admin/* and /api/cache/prefetch/*).")
+
 # ── Authentication Endpoints ──
 
 @app.route("/api/auth/register", methods=["POST"])
@@ -2270,6 +2380,9 @@ def chat_endpoint():
 
     chat_history = sessions[session_id]
 
+    # Week 4: record query transition for Markov chain training (before lookup)
+    prefetch_engine_w4.record_user_query(session_id, user_message)
+
     direct_response = _placements_response(user_message)
     if direct_response is None:
         direct_response = _campus_location_response(user_message)
@@ -2284,11 +2397,13 @@ def chat_endpoint():
     # ── CacheMind Semantic Cache Intercept (Week 2) ──
     is_hit, cached_response, similarity, cache_lat_ms, matched_q = cachemind.lookup(user_message)
     if is_hit and cached_response:
-        print(f"🎯 CacheMind HIT: '{user_message}' matched '{matched_q}' (sim={similarity:.4f}, {cache_lat_ms:.2f}ms)")
+        print(f"[CacheMind] HIT: '{user_message}' matched '{matched_q}' (sim={similarity:.4f}, {cache_lat_ms:.2f}ms)")
         cached_reply = cached_response.get("reply", "")
         chat_history.append(HumanMessage(content=user_message))
         chat_history.append(AIMessage(content=cached_reply))
         _trim_history(session_id, chat_history)
+        # Week 4: notify prefetch engine for hit-accuracy telemetry
+        prefetch_engine_w4.notify_cache_hit(user_message, cached_response, latency_ms=cache_lat_ms)
 
         resp = dict(cached_response)
         resp["cached"] = True
@@ -2428,6 +2543,15 @@ def chat_endpoint():
     # Store cache entry for this query
     cachemind.store(user_message, response_data)
     response_data["cached"] = False
+
+    # Week 4: trigger background prefetch for predicted next queries
+    _user_ctx = get_current_user()
+    prefetch_engine_w4.trigger_prefetch_if_applicable(
+        current_query=user_message,
+        session_id=session_id,
+        auth_role=_user_ctx.get("role", "student") if _user_ctx else "student",
+        user_id=_user_ctx.get("id") if _user_ctx else None,
+    )
     return jsonify(response_data)
 
 
@@ -2477,6 +2601,9 @@ def chat_stream_endpoint():
 
     chat_history = sessions[session_id]
 
+    # Week 4: record query transition for Markov chain training (before lookup)
+    prefetch_engine_w4.record_user_query(session_id, user_message)
+
     # ── CacheMind Semantic Cache Intercept (Week 2) ──
     is_hit, cached_response, similarity, cache_lat_ms, matched_q = cachemind.lookup(user_message)
     if is_hit and cached_response:
@@ -2485,6 +2612,9 @@ def chat_stream_endpoint():
         chat_history.append(HumanMessage(content=user_message))
         chat_history.append(AIMessage(content=cached_reply))
         _trim_history(session_id, chat_history)
+
+        # Week 4: notify prefetch engine for hit-accuracy telemetry
+        prefetch_engine_w4.notify_cache_hit(user_message, cached_response, latency_ms=cache_lat_ms)
 
         def generate_cached():
             for word in cached_reply.split(" "):
@@ -2648,6 +2778,16 @@ def chat_stream_endpoint():
             done_payload["source_path"] = os.path.join(DOCS_FOLDER, source_file)
 
         cachemind.store(user_message, store_payload)
+
+        # Week 4: trigger background prefetch for predicted next queries
+        _user_ctx = get_current_user()
+        prefetch_engine_w4.trigger_prefetch_if_applicable(
+            current_query=user_message,
+            session_id=session_id,
+            auth_role=_user_ctx.get("role", "student") if _user_ctx else "student",
+            user_id=_user_ctx.get("id") if _user_ctx else None,
+        )
+
         yield f"data: {json.dumps(done_payload)}\n\n"
 
     return Response(
@@ -2726,6 +2866,19 @@ def serve_navigation_image(filename):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import atexit
+
+    # Week 4: Start background website sync scheduler
+    sync_interval_hours = int(os.getenv("SYNC_INTERVAL_HOURS", "6"))
+    sync_enabled = os.getenv("SYNC_ENABLED", "true").lower() in ("true", "1", "yes")
+    if sync_enabled and sync_service_w4:
+        try:
+            sync_service_w4.start_scheduler(interval_hours=sync_interval_hours)
+            atexit.register(sync_service_w4.stop_scheduler)
+            print(f"🔄 VJTI Website Sync Scheduler started (interval={sync_interval_hours}h)")
+        except Exception as e:
+            print(f"⚠️  Could not start VJTI Website Sync Scheduler: {e}")
+
     print("\n" + "=" * 60)
     print(f"🤖 VJTI Bot API starting...")
     print(f"   Routing model  : {ROUTING_MODEL}  (Call #1 — picks tool only)")
@@ -2734,5 +2887,10 @@ if __name__ == "__main__":
     print(f"   Navigation images folder : {NAV_IMAGES_FOLDER}")
     print(f"   Endpoints      : /api/chat         (JSON)")
     print(f"                    /api/chat/stream  (SSE streaming)")
+    print(f"                    /api/admin/*      (Week 4 Admin Management)")
+    print(f"   Week 4 Features: Prefetch Engine, Document Ingestion, Website Sync")
     print("=" * 60)
-    app.run(host="0.0.0.0", port=5000, debug=True)
+
+    # Use use_reloader=False to prevent duplicate background schedulers in dev mode
+    is_debug = os.getenv("FLASK_DEBUG", "false").lower() in ("true", "1")
+    app.run(host="0.0.0.0", port=5000, debug=is_debug, use_reloader=False)
